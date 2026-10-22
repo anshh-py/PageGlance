@@ -7,7 +7,7 @@ type Block =
   | { type: 'quote'; text: string }
   | { type: 'code'; text: string }
 
-const INLINE_MARKUP = /(\*\*.+?\*\*|\*[^*]+\*|`[^`]+`)/g
+const INLINE_MARKUP = /(\[[A-Za-z][A-Za-z0-9_-]*\]|\*\*.+?\*\*|\*[^*]+\*|`[^`]+`)/g
 const HEADING = /^(#{1,3})\s+(.+)$/
 const UNORDERED_ITEM = /^\s*[-*+]\s+(.+)$/
 const ORDERED_ITEM = /^\s*\d+[.)]\s+(.+)$/
@@ -83,8 +83,26 @@ function parseBlocks(markdown: string): Block[] {
   return blocks
 }
 
-function renderInline(text: string): ReactNode[] {
+function renderInline(
+  text: string,
+  citationIds: string[],
+  onCitationClick?: (id: string) => void,
+): ReactNode[] {
   return text.split(INLINE_MARKUP).filter(Boolean).map((part, index) => {
+    const citation = part.match(/^\[([A-Za-z][A-Za-z0-9_-]*)\]$/)
+    if (citation && citationIds.includes(citation[1]) && onCitationClick) {
+      return (
+        <button
+          key={index}
+          type="button"
+          className="inline-citation"
+          onClick={() => onCitationClick(citation[1])}
+          aria-label={`Show source ${citation[1]}`}
+        >
+          {part}
+        </button>
+      )
+    }
     if (part.startsWith('**') && part.endsWith('**')) {
       return <strong key={index}>{part.slice(2, -2)}</strong>
     }
@@ -98,29 +116,37 @@ function renderInline(text: string): ReactNode[] {
   })
 }
 
-export function MarkdownAnswer({ text }: { text: string }) {
+export function MarkdownAnswer({
+  text,
+  citationIds = [],
+  onCitationClick,
+}: {
+  text: string
+  citationIds?: string[]
+  onCitationClick?: (id: string) => void
+}) {
   return (
     <div className="answer-content">
       {parseBlocks(text).map((block, index) => {
         if (block.type === 'heading') {
           const Tag = block.depth === 1 ? 'h3' : block.depth === 2 ? 'h4' : 'h5'
-          return <Tag key={index}>{renderInline(block.text)}</Tag>
+          return <Tag key={index}>{renderInline(block.text, citationIds, onCitationClick)}</Tag>
         }
         if (block.type === 'list') {
           const Tag = block.ordered ? 'ol' : 'ul'
           return (
             <Tag key={index}>
-              {block.items.map((item, itemIndex) => <li key={itemIndex}>{renderInline(item)}</li>)}
+              {block.items.map((item, itemIndex) => <li key={itemIndex}>{renderInline(item, citationIds, onCitationClick)}</li>)}
             </Tag>
           )
         }
         if (block.type === 'quote') {
-          return <blockquote key={index}>{renderInline(block.text)}</blockquote>
+          return <blockquote key={index}>{renderInline(block.text, citationIds, onCitationClick)}</blockquote>
         }
         if (block.type === 'code') {
           return <pre key={index}><code>{block.text}</code></pre>
         }
-        return <p key={index}>{renderInline(block.text)}</p>
+        return <p key={index}>{renderInline(block.text, citationIds, onCitationClick)}</p>
       })}
     </div>
   )

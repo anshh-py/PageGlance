@@ -1,6 +1,21 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
+import { useCallback, useEffect, useReducer, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
 import type { ThemePreference } from './main'
 import { consumeAnswerStream, parseAskResponse } from './api'
+import {
+  addUploadedDocument,
+  createScopedAskRequest,
+  removeUploadedDocument,
+  uploadStateReducer,
+  uploadDocument,
+  type DocumentConversation,
+  type UploadedDocument,
+} from './documents'
+import {
+  loadDocumentConversations,
+  loadUploadedDocuments,
+  saveDocumentConversations,
+  saveUploadedDocuments,
+} from './documentStorage'
 import {
   buildConversationHistory,
   beginNewChat,
@@ -12,18 +27,14 @@ import {
   restoreConversation,
   runSuggestion,
   SUGGESTIONS,
+  type ConversationStore,
   type ChatMessage,
   type Conversation,
-  type ConversationStore,
 } from './chat'
 import { clearConversationStore, loadConversationStore, saveConversationStore } from './chatStorage'
+import { AnswerWithSources } from './SourceCitations'
 import { MarkdownAnswer } from './MarkdownAnswer'
-import {
-  EXTRACT_PAGE_MESSAGE,
-  type AskRequest,
-  type ExtractPageResponse,
-  type PageContext,
-} from './messages'
+import { EXTRACT_PAGE_MESSAGE, type AskRequest, type ExtractPageResponse, type PageContext } from './messages'
 import './App.css'
 
 const API_URL = (import.meta.env.VITE_PAGEGLANCE_API_URL || 'http://127.0.0.1:8000').replace(/\/$/, '')
@@ -31,13 +42,19 @@ const THEME_ORDER: ThemePreference[] = ['system', 'light', 'dark']
 const STORAGE_DEBOUNCE_MS = 250
 const HISTORY_MAX_MESSAGES = 20
 const HISTORY_MAX_CHARS = 32_000
+const SELECTED_DOCUMENT_KEY = 'pageGlanceSelectedDocument'
+type PageStatus = 'loading' | 'ready' | 'unsupported'
+
+function formatFileSize(size: number): string {
+  if (size < 1024) return `${size} B`
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(0)} KB`
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`
+}
 
 interface AppProps {
   initialTheme: ThemePreference
   fullPage?: boolean
 }
-
-type PageStatus = 'loading' | 'ready' | 'unsupported'
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Something went wrong. Please try again.'
@@ -53,9 +70,8 @@ async function extractPage(tabId: number): Promise<PageContext> {
     if (!result.page.text) throw new Error('No readable page text was found on this tab.')
     return result.page
   } catch (error) {
-    const detail = getErrorMessage(error)
     throw new Error(
-      `PageGlance cannot read this tab. Chrome restricts extensions on internal pages and the Chrome Web Store. (${detail})`,
+      `PageGlance cannot read this tab. Chrome restricts extensions on internal pages and the Chrome Web Store. (${getErrorMessage(error)})`,
       { cause: error },
     )
   }
@@ -82,15 +98,25 @@ function App({ initialTheme, fullPage = false }: AppProps) {
   const [pageUrl, setPageUrl] = useState('')
   const [pageTitle, setPageTitle] = useState('')
   const [pageStatus, setPageStatus] = useState<PageStatus>('loading')
-  const [restoreReady, setRestoreReady] = useState(false)
   const [pageError, setPageError] = useState('')
+  const [uploadedDocuments, setUploadedDocuments] = useState<UploadedDocument[]>([])
+  const [selectedDocument, setSelectedDocument] = useState<UploadedDocument | null>(null)
+  const [sourceMenuOpen, setSourceMenuOpen] = useState(false)
+  const [uploadState, dispatchUpload] = useReducer(uploadStateReducer, { status: 'idle' })
+  const [restoreReady, setRestoreReady] = useState(false)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const [copiedMessageId, setCopiedMessageId] = useState('')
   const conversationRef = useRef<Conversation | null>(null)
+  const uploadedDocumentsRef = useRef<UploadedDocument[]>([])
+  const documentConversationsRef = useRef<Record<string, DocumentConversation>>({})
   const storeRef = useRef<ConversationStore>({ version: 1, conversations: {} })
   const pageUrlRef = useRef('')
+  const pageTitleRef = useRef('')
   const pageContextRef = useRef<PageContext | null>(null)
+  const selectedDocumentRef = useRef<UploadedDocument | null>(null)
+  const sourceSelectorButtonRef = useRef<HTMLButtonElement>(null)
+  const documentFileInputRef = useRef<HTMLInputElement>(null)
   const controllerRef = useRef<AbortController | null>(null)
   const requestInFlightRef = useRef(false)
   const mountedRef = useRef(false)
@@ -98,6 +124,16 @@ function App({ initialTheme, fullPage = false }: AppProps) {
   const persistQueueRef = useRef<Promise<void>>(Promise.resolve())
 
   const queueSave = useCallback(() => {
+    const documentSnapshot = JSON.parse(JSON.stringify(documentConversationsRef.current)) as Record<string, DocumentConversation>
+    persistQueueRef.current = persistQueueRef.current
+      .catch(() => undefined)
+      .then(() => saveDocumentConversations(documentSnapshot))
+      .catch(() => {
+        if (mountedRef.current) setError('Could not save this conversation to extension storage.')
+      })
+  }, [])
+
+  const queuePageSave = useCallback(() => {
     const snapshot = JSON.parse(JSON.stringify(storeRef.current)) as ConversationStore
     persistQueueRef.current = persistQueueRef.current
       .catch(() => undefined)
@@ -110,7 +146,17 @@ function App({ initialTheme, fullPage = false }: AppProps) {
   const commitConversation = useCallback((next: Conversation, immediate = false) => {
     conversationRef.current = next
     if (mountedRef.current) setConversation(next)
-    if (next.pageUrl) {
+    const activeDocument = selectedDocumentRef.current
+    if (next.pageUrl && activeDocument) {
+      documentConversationsRef.current = {
+        ...documentConversationsRef.current,
+        [activeDocument.document_id]: {
+          updatedAt: next.updatedAt,
+          draft: next.draft,
+          messages: next.messages,
+        },
+      }
+    } else if (next.pageUrl) {
       storeRef.current = {
         ...storeRef.current,
         version: 1,
@@ -120,16 +166,38 @@ function App({ initialTheme, fullPage = false }: AppProps) {
             .slice(0, MAX_STORED_CONVERSATIONS),
         ),
       }
+    }
+    if (next.pageUrl) {
       if (persistTimerRef.current) clearTimeout(persistTimerRef.current)
-      if (immediate) queueSave()
+      const save = activeDocument ? queueSave : queuePageSave
+      if (immediate) save()
       else {
         persistTimerRef.current = setTimeout(() => {
           persistTimerRef.current = null
-          queueSave()
+          save()
         }, STORAGE_DEBOUNCE_MS)
       }
     }
-  }, [queueSave])
+  }, [queuePageSave, queueSave])
+
+  const activateDocument = useCallback((document: UploadedDocument | null) => {
+    selectedDocumentRef.current = document
+    setSelectedDocument(document)
+    const next = document
+      ? (() => {
+          const saved = documentConversationsRef.current[document.document_id]
+          return saved
+            ? { pageUrl: `document:${document.document_id}`, pageTitle: document.filename, updatedAt: saved.updatedAt, draft: saved.draft, messages: [...saved.messages] }
+            : emptyConversation(`document:${document.document_id}`, document.filename)
+        })()
+      : pageUrlRef.current
+        ? restoreConversation(storeRef.current, pageUrlRef.current, pageTitleRef.current).conversation
+        : null
+    conversationRef.current = next
+    setConversation(next)
+    setQuestion(next?.draft ?? '')
+    setError('')
+  }, [])
 
   useEffect(() => {
     mountedRef.current = true
@@ -146,57 +214,50 @@ function App({ initialTheme, fullPage = false }: AppProps) {
         pageUrlRef.current = initialUrl
         setPageUrl(initialUrl)
         setPageTitle(tab?.title ?? '')
-
-        const store = await loadConversationStore()
+        pageTitleRef.current = tab?.title ?? ''
+        const [docs, documentConversations, store] = await Promise.all([
+          loadUploadedDocuments(), loadDocumentConversations(), loadConversationStore(),
+        ])
         if (!active) return
+        uploadedDocumentsRef.current = docs
+        setUploadedDocuments(docs)
+        documentConversationsRef.current = documentConversations
         storeRef.current = store
-        if (initialUrl) {
-          const restored = restoreConversation(store, initialUrl, tab?.title ?? '')
+        let restored = initialUrl ? restoreConversation(store, initialUrl, tab?.title ?? '') : null
+        if (restored) {
           conversationRef.current = restored.conversation
           setConversation(restored.conversation)
           setQuestion(restored.conversation.draft)
-          if (restored.interrupted) {
-            storeRef.current = {
-              ...store,
-              conversations: {
-                ...store.conversations,
-                [initialUrl]: restored.conversation,
-              },
-            }
-            queueSave()
-          }
+          if (restored.interrupted) queuePageSave()
         }
         if (active) setRestoreReady(true)
-        if (active) setPageStatus('loading')
 
-        if (tab?.id === undefined || !initialUrl) {
-          throw new Error('PageGlance could not identify the active webpage.')
-        }
+        const requestedDocumentId = fullPage ? new URLSearchParams(location.search).get('documentId') : null
+        const requestedDocument = requestedDocumentId
+          ? docs.find((item) => item.document_id === requestedDocumentId) ?? null
+          : null
+        if (requestedDocument) activateDocument(requestedDocument)
+        if (tab?.id === undefined || !initialUrl) throw new Error('PageGlance could not identify the active webpage.')
+        setPageStatus('loading')
         const extracted = await extractPage(tab.id)
         if (!active) return
-        const extractedUrl = normalizePageUrl(extracted.url)
         pageContextRef.current = extracted
         setPageTitle(extracted.title)
-
+        pageTitleRef.current = extracted.title
+        const extractedUrl = normalizePageUrl(extracted.url)
         if (extractedUrl && extractedUrl !== initialUrl) {
-          const updatedStore = await loadConversationStore()
-          if (!active) return
-          storeRef.current = updatedStore
           pageUrlRef.current = extractedUrl
           setPageUrl(extractedUrl)
-          const restored = restoreConversation(updatedStore, extractedUrl, extracted.title)
-          conversationRef.current = restored.conversation
-          setConversation(restored.conversation)
-          setQuestion(restored.conversation.draft)
-          if (restored.interrupted) {
-            storeRef.current = {
-              ...updatedStore,
-              conversations: { ...updatedStore.conversations, [extractedUrl]: restored.conversation },
-            }
-            queueSave()
+          restored = restoreConversation(storeRef.current, extractedUrl, extracted.title)
+          if (!selectedDocumentRef.current) {
+            conversationRef.current = restored.conversation
+            setConversation(restored.conversation)
+            setQuestion(restored.conversation.draft)
           }
-        } else if (conversationRef.current && conversationRef.current.pageTitle !== extracted.title) {
-          commitConversation({ ...conversationRef.current, pageTitle: extracted.title })
+        } else if (!selectedDocumentRef.current && conversationRef.current) {
+          const updated = { ...conversationRef.current, pageTitle: extracted.title }
+          conversationRef.current = updated
+          setConversation(updated)
         }
         setPageStatus('ready')
       } catch (caught) {
@@ -207,7 +268,6 @@ function App({ initialTheme, fullPage = false }: AppProps) {
         }
       }
     }
-
     void restore()
     return () => {
       active = false
@@ -216,26 +276,20 @@ function App({ initialTheme, fullPage = false }: AppProps) {
       if (persistTimerRef.current) clearTimeout(persistTimerRef.current)
       const current = conversationRef.current
       if (current) {
-        const interrupted = {
-          ...current,
-          updatedAt: Date.now(),
-          messages: current.messages.map((message) =>
-            message.role === 'assistant' && message.status === 'streaming'
-              ? { ...message, status: 'interrupted' as const }
-              : message,
-          ),
-        }
+        const interrupted = { ...current, updatedAt: Date.now(), messages: current.messages.map((message) =>
+          message.role === 'assistant' && message.status === 'streaming' ? { ...message, status: 'interrupted' as const } : message) }
         conversationRef.current = interrupted
-        if (interrupted.pageUrl) {
-          storeRef.current = {
-            ...storeRef.current,
-            conversations: { ...storeRef.current.conversations, [interrupted.pageUrl]: interrupted },
-          }
+        if (selectedDocumentRef.current && interrupted.pageUrl) {
+          const doc = selectedDocumentRef.current
+          documentConversationsRef.current[doc.document_id] = { updatedAt: interrupted.updatedAt, draft: interrupted.draft, messages: interrupted.messages }
           queueSave()
+        } else if (interrupted.pageUrl) {
+          storeRef.current.conversations[interrupted.pageUrl] = interrupted
+          queuePageSave()
         }
       }
     }
-  }, [commitConversation, fullPage, queueSave])
+  }, [activateDocument, fullPage, queuePageSave, queueSave])
 
   function handleThemeChange() {
     const nextTheme = THEME_ORDER[(THEME_ORDER.indexOf(theme) + 1) % THEME_ORDER.length]
@@ -252,11 +306,84 @@ function App({ initialTheme, fullPage = false }: AppProps) {
     if (current) commitConversation({ ...current, draft: value })
   }
 
+  async function handleDocumentSelection(documentId: string) {
+    if (loading || requestInFlightRef.current) return
+    if (persistTimerRef.current) {
+      clearTimeout(persistTimerRef.current)
+      persistTimerRef.current = null
+      if (selectedDocumentRef.current) queueSave()
+      else queuePageSave()
+    }
+    await persistQueueRef.current.catch(() => undefined)
+    const document = documentId
+      ? uploadedDocumentsRef.current.find((item) => item.document_id === documentId) ?? null
+      : null
+    if (documentId && !document) return
+    activateDocument(document)
+    try {
+      if (document) await chrome.storage.local.set({ [SELECTED_DOCUMENT_KEY]: document.document_id })
+      else await chrome.storage.local.remove(SELECTED_DOCUMENT_KEY)
+    } catch {
+      setError('Could not save the selected chat context to extension storage.')
+    }
+  }
+
+  async function handleRemoveDocument(documentId: string) {
+    if (loading || requestInFlightRef.current) return
+    const nextDocuments = removeUploadedDocument(uploadedDocumentsRef.current, documentId)
+    if (nextDocuments.length === uploadedDocumentsRef.current.length) return
+    const removingSelectedDocument = selectedDocumentRef.current?.document_id === documentId
+    try {
+      await saveUploadedDocuments(nextDocuments)
+      if (removingSelectedDocument) await chrome.storage.local.remove(SELECTED_DOCUMENT_KEY)
+      uploadedDocumentsRef.current = nextDocuments
+      setUploadedDocuments(nextDocuments)
+      if (removingSelectedDocument) activateDocument(null)
+      setSourceMenuOpen(false)
+      setError('')
+    } catch {
+      setError('Could not remove this document from the extension library.')
+    }
+  }
+
+  async function handleUploadDocument(file: File) {
+    if (uploadState.status === 'uploading') return
+    dispatchUpload({ type: 'start', filename: file.name })
+    try {
+      const response = await uploadDocument(file, API_URL)
+      if (persistTimerRef.current) {
+        clearTimeout(persistTimerRef.current)
+        persistTimerRef.current = null
+        if (selectedDocumentRef.current) queueSave()
+        else queuePageSave()
+      }
+      await persistQueueRef.current.catch(() => undefined)
+      const nextDocuments = addUploadedDocument(uploadedDocumentsRef.current, {
+        ...response,
+        file_size_bytes: file.size,
+      })
+      await saveUploadedDocuments(nextDocuments)
+      const uploaded = nextDocuments.find((item) => item.document_id === response.document_id)
+      if (!uploaded) throw new Error('The uploaded document could not be saved in this browser.')
+      uploadedDocumentsRef.current = nextDocuments
+      setUploadedDocuments(nextDocuments)
+      activateDocument(uploaded)
+      await chrome.storage.local.set({ [SELECTED_DOCUMENT_KEY]: uploaded.document_id })
+      dispatchUpload({
+        type: 'success',
+        message: `${uploaded.filename} ${uploaded.duplicate ? 'is already available' : 'uploaded'} · ${uploaded.chunk_count} chunks${uploaded.page_count ? ` · ${uploaded.page_count} pages` : ''}.`,
+      })
+    } catch (caught) {
+      dispatchUpload({ type: 'error', message: getErrorMessage(caught) })
+    }
+  }
+
   async function submitQuestion(rawQuestion: string) {
     const trimmedQuestion = rawQuestion.trim()
     if (!trimmedQuestion || requestInFlightRef.current) return
-    if (pageStatus !== 'ready' || !pageUrlRef.current) {
-      setError(pageError || 'Open a supported webpage before asking PageGlance.')
+    const activeDocument = selectedDocumentRef.current
+    if (activeDocument ? !activeDocument.document_id : (pageStatus !== 'ready' || !pageUrlRef.current)) {
+      setError(activeDocument ? 'Select a valid document before asking a question.' : (pageError || 'Open a supported webpage before asking PageGlance.'))
       return
     }
 
@@ -269,18 +396,25 @@ function App({ initialTheme, fullPage = false }: AppProps) {
     let partialAnswer = ''
 
     try {
-      let page = pageContextRef.current
-      if (!page) {
-        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
-        if (!tab?.id) throw new Error('Could not find the active tab.')
-        page = await extractPage(tab.id)
-        pageContextRef.current = page
+      let page: PageContext | null = null
+      if (!activeDocument) {
+        page = pageContextRef.current
+        if (!page) {
+          const sourceTabId = fullPage ? Number(new URLSearchParams(location.search).get('sourceTabId')) : NaN
+          const tab = Number.isInteger(sourceTabId) && sourceTabId > 0
+            ? await chrome.tabs.get(sourceTabId)
+            : (await chrome.tabs.query({ active: true, currentWindow: true }))[0]
+          if (tab?.id === undefined) throw new Error('Could not find the active tab.')
+          page = await extractPage(tab.id)
+          pageContextRef.current = page
+        }
+        if (normalizePageUrl(page.url) !== pageUrlRef.current) {
+          throw new Error('The active page changed. Close and reopen PageGlance on the new page.')
+        }
       }
-      if (normalizePageUrl(page.url) !== pageUrlRef.current) {
-        throw new Error('The active page changed. Close and reopen PageGlance on the new page.')
-      }
-
-      const current = conversationRef.current ?? emptyConversation(pageUrlRef.current, page.title)
+      const conversationKey = activeDocument ? `document:${activeDocument.document_id}` : pageUrlRef.current
+      const conversationTitle = activeDocument?.filename ?? page?.title ?? pageTitleRef.current
+      const current = conversationRef.current ?? emptyConversation(conversationKey, conversationTitle)
       const history = buildConversationHistory(
         current.messages,
         HISTORY_MAX_MESSAGES,
@@ -290,19 +424,20 @@ function App({ initialTheme, fullPage = false }: AppProps) {
       const assistantMessage = createMessage('assistant', '', 'streaming')
       const nextConversation: Conversation = {
         ...current,
-        pageUrl: pageUrlRef.current,
-        pageTitle: page.title,
+        pageUrl: conversationKey,
+        pageTitle: conversationTitle,
         updatedAt: userMessage.timestamp,
         draft: '',
         messages: [...current.messages, userMessage, assistantMessage].slice(-MAX_STORED_MESSAGES),
       }
       setQuestion('')
       commitConversation(nextConversation, true)
-      const payload: AskRequest = {
-        question: trimmedQuestion,
+      const payload: AskRequest = createScopedAskRequest(
+        trimmedQuestion,
         page,
+        activeDocument,
         history,
-      }
+      )
       const response = await fetch(`${API_URL}/ask/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -329,6 +464,21 @@ function App({ initialTheme, fullPage = false }: AppProps) {
             content: partialAnswer,
           })),
         )
+      }, (sources) => {
+        const latest = conversationRef.current
+        if (!latest) return
+        commitConversation(updateMessage(latest, assistantMessage.id, (message) => ({
+          ...message,
+          sources,
+        })))
+      }, (answer) => {
+        partialAnswer = answer
+        const latest = conversationRef.current
+        if (!latest) return
+        commitConversation(updateMessage(latest, assistantMessage.id, (message) => ({
+          ...message,
+          content: answer,
+        })))
       })
       if (partialAnswer) partialAnswer = parseAskResponse({ answer: partialAnswer }).answer
       const latest = conversationRef.current
@@ -396,6 +546,15 @@ function App({ initialTheme, fullPage = false }: AppProps) {
 
   function handleNewChat() {
     const current = conversationRef.current
+    const activeDocument = selectedDocumentRef.current
+    if (activeDocument) {
+      if ((current?.messages.length || current?.draft) && !window.confirm(`Start a new chat about ${activeDocument.filename}?`)) return
+      const next = emptyConversation(`document:${activeDocument.document_id}`, activeDocument.filename)
+      setQuestion('')
+      setError('')
+      commitConversation(next, true)
+      return
+    }
     if (!pageUrlRef.current) return
     if (
       (current?.messages.length || current?.draft) &&
@@ -403,7 +562,7 @@ function App({ initialTheme, fullPage = false }: AppProps) {
     ) {
       return
     }
-    const started = beginNewChat(storeRef.current, pageUrlRef.current, pageTitle)
+    const started = beginNewChat(storeRef.current, pageUrlRef.current, pageTitleRef.current)
     storeRef.current = started.store
     setQuestion('')
     setError('')
@@ -411,27 +570,43 @@ function App({ initialTheme, fullPage = false }: AppProps) {
   }
 
   async function handleClearHistory() {
-    const hasHistory = Object.values(storeRef.current.conversations).some(
-      (item) => item.messages.length > 0 || Boolean(item.draft),
-    )
-    if (hasHistory && !window.confirm('Clear all saved PageGlance conversations?')) return
+    const activeDocument = selectedDocumentRef.current
+    if (activeDocument) {
+      const saved = documentConversationsRef.current[activeDocument.document_id]
+      if ((saved?.messages.length || saved?.draft) &&
+        !window.confirm(`Clear the saved chat for ${activeDocument.filename}?`)) return
+    } else {
+      const hasHistory = Object.values(storeRef.current.conversations).some(
+        (item) => item.messages.length > 0 || Boolean(item.draft),
+      )
+      if (hasHistory && !window.confirm('Clear all saved PageGlance conversations?')) return
+    }
     try {
       if (persistTimerRef.current) {
         clearTimeout(persistTimerRef.current)
         persistTimerRef.current = null
       }
       await persistQueueRef.current.catch(() => undefined)
-      await clearConversationStore()
-      const cleared: ConversationStore = { version: 1, conversations: {} }
-      storeRef.current = cleared
-      if (pageUrlRef.current) {
-        const blank = emptyConversation(pageUrlRef.current, pageTitle)
-        storeRef.current.conversations[pageUrlRef.current] = blank
+      if (activeDocument) {
+        const nextDocuments = { ...documentConversationsRef.current }
+        delete nextDocuments[activeDocument.document_id]
+        documentConversationsRef.current = nextDocuments
+        const blank = emptyConversation(`document:${activeDocument.document_id}`, activeDocument.filename)
         conversationRef.current = blank
         setConversation(blank)
+        await saveDocumentConversations(nextDocuments)
       } else {
-        conversationRef.current = null
-        setConversation(null)
+        await clearConversationStore()
+        storeRef.current = { version: 1, conversations: {} }
+        if (pageUrlRef.current) {
+          const blank = emptyConversation(pageUrlRef.current, pageTitleRef.current)
+          storeRef.current.conversations[pageUrlRef.current] = blank
+          conversationRef.current = blank
+          setConversation(blank)
+        } else {
+          conversationRef.current = null
+          setConversation(null)
+        }
       }
       setQuestion('')
       setError('')
@@ -455,13 +630,20 @@ function App({ initialTheme, fullPage = false }: AppProps) {
       if (persistTimerRef.current) {
         clearTimeout(persistTimerRef.current)
         persistTimerRef.current = null
-        queueSave()
+        if (selectedDocumentRef.current) queueSave()
+        else queuePageSave()
       }
       await persistQueueRef.current
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
-      if (!tab?.id) throw new Error('Could not identify the current webpage.')
       const fullPageUrl = new URL(chrome.runtime.getURL('chat.html'))
-      fullPageUrl.searchParams.set('sourceTabId', String(tab.id))
+      const sourceTabId = fullPage ? Number(new URLSearchParams(location.search).get('sourceTabId')) : NaN
+      const sourceTab = Number.isInteger(sourceTabId) && sourceTabId > 0
+        ? await chrome.tabs.get(sourceTabId)
+        : (await chrome.tabs.query({ active: true, currentWindow: true }))[0]
+      if (!sourceTab?.id) throw new Error('Could not identify the current webpage.')
+      fullPageUrl.searchParams.set('sourceTabId', String(sourceTab.id))
+      if (selectedDocumentRef.current) {
+        fullPageUrl.searchParams.set('documentId', selectedDocumentRef.current.document_id)
+      }
       await chrome.tabs.create({ url: fullPageUrl.toString(), active: true })
     } catch {
       setError('Could not open PageGlance in a new tab. Your saved conversation is unchanged.')
@@ -473,7 +655,34 @@ function App({ initialTheme, fullPage = false }: AppProps) {
     theme === 'dark' ||
     (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)
   const messages = conversation?.messages ?? []
-  const canAsk = pageStatus === 'ready' && !loading
+  const canAsk = restoreReady && (selectedDocument ? true : pageStatus === 'ready') && !loading
+  const uploadControl = (
+    <button
+      type="button"
+      className={`document-upload-button${uploadState.status === 'uploading' ? ' is-uploading' : ''}`}
+      onClick={() => documentFileInputRef.current?.click()}
+      disabled={uploadState.status === 'uploading' || loading || !restoreReady}
+      aria-label={uploadState.status === 'uploading' ? 'Uploading document' : 'Upload TXT or PDF'}
+      title="Upload TXT or PDF"
+    >
+      {uploadState.status === 'uploading' ? (
+        <span className="document-upload-spinner" aria-hidden="true" />
+      ) : (
+        <svg viewBox="0 0 20 20" aria-hidden="true">
+          <path d="M5.5 2.5h6l3 3v12h-9z" />
+          <path d="M11.5 2.5v3h3M7.5 12h5M10 9.5v5" />
+        </svg>
+      )}
+      <span className="upload-button-label">{uploadState.status === 'uploading' ? 'Uploading' : '📤 Upload'}</span>
+    </button>
+  )
+  function handleSourceMenuKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      setSourceMenuOpen(false)
+      sourceSelectorButtonRef.current?.focus()
+    }
+  }
 
   return (
     <main className={`popup${fullPage ? ' full-page' : ''}`}>
@@ -481,7 +690,7 @@ function App({ initialTheme, fullPage = false }: AppProps) {
         <img className="brand-mark" src="/icons/pageglance-48.png" alt="" />
         <div className="brand-copy">
           <p className="eyebrow">PAGEGLANCE</p>
-          <h1>Ask this page</h1>
+          <h1>{selectedDocument ? 'Document chat' : 'Ask this page'}</h1>
         </div>
         <button
           className="theme-toggle expand-toggle"
@@ -515,17 +724,121 @@ function App({ initialTheme, fullPage = false }: AppProps) {
         </button>
       </header>
 
-      <section className="page-context" aria-label="Current webpage">
-        <span className="page-context-icon" aria-hidden="true">↗</span>
-        <div>
-          <p className="page-title">{pageTitle || (pageStatus === 'loading' ? 'Reading page…' : 'No page available')}</p>
-          <p className="page-url">{pageUrl}</p>
+      <input
+        ref={documentFileInputRef}
+        className="document-file-input"
+        type="file"
+        accept=".txt,.pdf,text/plain,application/pdf"
+        aria-label="Choose a TXT or PDF document"
+        tabIndex={-1}
+        onChange={(event) => {
+          const file = event.target.files?.[0]
+          if (file) void handleUploadDocument(file)
+          event.target.value = ''
+        }}
+        disabled={uploadState.status === 'uploading' || loading}
+      />
+      <div className="context-row">
+      {uploadedDocuments.length > 0 && (
+        <div className="source-selector">
+          <button
+            ref={sourceSelectorButtonRef}
+            type="button"
+            className="context-source-select"
+            aria-label={`Chat source: ${selectedDocument?.filename ?? 'Current webpage'}`}
+            aria-expanded={sourceMenuOpen}
+            aria-controls="source-menu"
+            onClick={() => setSourceMenuOpen((open) => !open)}
+            disabled={!restoreReady || loading}
+          >
+            <span>{selectedDocument?.filename ?? 'Current webpage'}</span>
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
+          </button>
+          {sourceMenuOpen && (
+            <div
+              className="source-menu"
+              id="source-menu"
+              role="group"
+              aria-label="Choose chat source"
+              onKeyDown={handleSourceMenuKeyDown}
+            >
+              <button
+                type="button"
+                className="source-option"
+                aria-pressed={!selectedDocument}
+                onClick={() => {
+                  setSourceMenuOpen(false)
+                  void handleDocumentSelection('')
+                }}
+              >
+                <span>Current webpage</span>
+                {!selectedDocument && <span className="source-option-check" aria-hidden="true">✓</span>}
+              </button>
+              {uploadedDocuments.map((document) => (
+                <div className="source-menu-item" key={document.document_id}>
+                  <button
+                    type="button"
+                    className="source-option"
+                    aria-pressed={selectedDocument?.document_id === document.document_id}
+                    onClick={() => {
+                      setSourceMenuOpen(false)
+                      void handleDocumentSelection(document.document_id)
+                    }}
+                  >
+                    <span className="source-option-type" aria-hidden="true">{document.source_type.toUpperCase()}</span>
+                    <span className="source-option-name" title={document.filename}>{document.filename}</span>
+                    {selectedDocument?.document_id === document.document_id && (
+                      <span className="source-option-check" aria-hidden="true">✓</span>
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    className="remove-document-button"
+                    aria-label={`Remove ${document.filename} from uploaded documents`}
+                    title={`Remove ${document.filename}`}
+                    disabled={!restoreReady || loading}
+                    onClick={() => void handleRemoveDocument(document.document_id)}
+                  >
+                    <svg viewBox="0 0 20 20" aria-hidden="true">
+                      <path d="M4 6h12M8 6V4h4v2m-6 0 .7 10h6.6L14 6M8.5 9v4m3-4v4" />
+                    </svg>
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
-        <div className={`page-state page-state-${pageStatus}`} aria-label={`Page status: ${pageStatus}`} />
-      </section>
+      )}
+        {selectedDocument ? (
+          <section className="document-context" aria-label="Selected document details">
+            <span className="document-context-icon" aria-hidden="true">&#9635;</span>
+            <div className="document-context-copy">
+              <p className="document-title">{selectedDocument.filename}</p>
+              <p className="document-metadata">
+                {selectedDocument.source_type.toUpperCase()} | Ready | {selectedDocument.chunk_count} indexed chunks
+                {selectedDocument.page_count ? ` | ${selectedDocument.page_count} pages` : ''}
+                {selectedDocument.file_size_bytes ? ` | ${formatFileSize(selectedDocument.file_size_bytes)}` : ''}
+              </p>
+            </div>
+          </section>
+        ) : (
+          <section className={`page-context page-state-context-${pageStatus}`} aria-label="Current webpage">
+            <span className="page-context-icon" aria-hidden="true">↗</span>
+            <div>
+              <p className="page-title">{pageTitle || (pageStatus === 'loading' ? 'Reading page…' : 'No page available')}</p>
+              <p className="page-url" title={pageUrl}>{pageUrl || pageError}</p>
+            </div>
+            <div className={`page-state page-state-${pageStatus}`} aria-label={`Page status: ${pageStatus}`} />
+          </section>
+        )}
+        {uploadControl}
+      </div>
+      {uploadState.status === 'uploading' && <p className="document-feedback" role="status">Uploading {uploadState.filename}...</p>}
+      {uploadState.status === 'success' && <p className="document-feedback" role="status">{uploadState.message}</p>}
+      {uploadState.status === 'error' && <p className="message error document-feedback" role="alert">{uploadState.message}</p>}
 
       <div className="chat-actions">
-        <button type="button" className="quiet-button" onClick={handleNewChat} disabled={!pageUrl || pageStatus !== 'ready' || loading}>
+        <button type="button" className="quiet-button" onClick={handleNewChat} disabled={(!selectedDocument && (!pageUrl || pageStatus !== 'ready')) || loading}>
           <span aria-hidden="true">＋</span> New chat
         </button>
         <button type="button" className="quiet-button" onClick={() => void handleClearHistory()} disabled={!restoreReady || loading}>
@@ -534,28 +847,24 @@ function App({ initialTheme, fullPage = false }: AppProps) {
       </div>
 
       {!restoreReady && <div className="restore-status" role="status">Restoring your chat…</div>}
-      {pageStatus === 'unsupported' && (
+      {!selectedDocument && pageStatus === 'unsupported' && (
         <p className="message error" role="alert">{pageError || 'Open a supported webpage to use suggestions and ask questions.'}</p>
       )}
-
-      {restoreReady && !messages.length && (
+      {selectedDocument && restoreReady && !messages.length && (
+        <p className="document-welcome">Ask a question about {selectedDocument.filename}.</p>
+      )}
+      {!selectedDocument && restoreReady && !messages.length && (
         <section className="welcome-state" aria-label="Suggested actions">
           <div className="suggestions">
             {SUGGESTIONS.map((suggestion) => (
-              <button
-                className="suggestion-card"
-                type="button"
-                key={suggestion.id}
-                disabled={!canAsk}
-                onClick={() => runSuggestion(suggestion.id, (prompt) => void submitQuestion(prompt))}
-              >
+              <button className="suggestion-card" type="button" key={suggestion.id} disabled={!canAsk}
+                onClick={() => runSuggestion(suggestion.id, (prompt) => void submitQuestion(prompt))}>
                 <span><strong>{suggestion.title}</strong><small>{suggestion.description}</small></span>
                 <span className="suggestion-arrow" aria-hidden="true">→</span>
               </button>
             ))}
           </div>
           {pageStatus === 'loading' && <p className="page-loading-note" role="status">Checking whether this page is available…</p>}
-          {pageStatus === 'unsupported' && <p className="page-loading-note">Suggestions are unavailable for this tab.</p>}
         </section>
       )}
 
@@ -567,7 +876,9 @@ function App({ initialTheme, fullPage = false }: AppProps) {
                 <span className="message-role">{message.role === 'user' ? 'You' : 'PAGEGLANCE'}</span>
                 {message.role === 'assistant' && message.content ? (
                   <div className="assistant-bubble">
-                    <MarkdownAnswer text={message.content} />
+                    {message.sources?.length ? (
+                      <AnswerWithSources text={message.content} sources={message.sources} />
+                    ) : <MarkdownAnswer text={message.content} />}
                     <div className="message-tools">
                       {message.status === 'complete' && (
                         <button type="button" className="copy-button" onClick={() => void handleCopy(message)}>
@@ -606,13 +917,13 @@ function App({ initialTheme, fullPage = false }: AppProps) {
       {error && <p className="message error" role="alert">{error}</p>}
 
       <form className="composer" onSubmit={handleSubmit}>
-        <label htmlFor="question">YOUR QUESTION</label>
+        <label htmlFor="question">{selectedDocument ? 'QUESTION ABOUT DOCUMENT' : 'YOUR QUESTION'}</label>
         <textarea
           id="question"
           value={question}
           onChange={(event) => handleDraftChange(event.target.value)}
           onKeyDown={handleQuestionKeyDown}
-          placeholder={pageStatus === 'ready' ? 'Ask a follow-up about this page…' : 'Waiting for a supported webpage…'}
+          placeholder={selectedDocument ? 'Ask a question about this document...' : pageStatus === 'ready' ? 'Ask a follow-up about this page…' : 'Waiting for a supported webpage…'}
           maxLength={4000}
           rows={3}
           disabled={!canAsk}
@@ -626,7 +937,7 @@ function App({ initialTheme, fullPage = false }: AppProps) {
         <svg viewBox="0 0 16 16" aria-hidden="true">
           <path d="M3 6.5h10v7H3zM5 6.5V4a3 3 0 0 1 6 0v2.5" />
         </svg>
-        <span>Page content and this page’s chat go to your configured backend</span>
+        <span>{selectedDocument ? 'Questions and selected document content go to your configured backend' : 'Page content and this page’s chat go to your configured backend'}</span>
       </footer>
     </main>
   )

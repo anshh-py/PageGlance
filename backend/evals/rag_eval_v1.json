@@ -1,0 +1,169 @@
+{
+  "version": "rag-eval-v1",
+  "embedding_profile": "sentence_transformers:sentence-transformers/all-MiniLM-L6-v2:dimensions=384",
+  "corpus": [
+    {
+      "ref": "embeddings",
+      "document_id": "55cfc5f5-05ab-5fe4-9270-d557d88ca70b",
+      "chunk_id": "55cfc5f5-05ab-5fe4-9270-d557d88ca70b:chunk:0:0:260",
+      "source_type": "text",
+      "filename": "mini_embeddings.txt",
+      "title": "Embedding profile",
+      "text": "The configured local embedding model is sentence-transformers/all-MiniLM-L6-v2. It emits vectors with 384 dimensions. Embedding batches contain at most 64 texts. Legacy 1536-dimensional vectors are stored separately and are never mixed with this local profile."
+    },
+    {
+      "ref": "uploads",
+      "document_id": "89a8d2a4-ebc9-570b-8bba-c6cd95c14143",
+      "chunk_id": "89a8d2a4-ebc9-570b-8bba-c6cd95c14143:chunk:0:0:210",
+      "source_type": "text",
+      "filename": "upload_limits.txt",
+      "title": "Upload limits",
+      "text": "A document upload can be at most 25 MiB. The multipart request limit adds 256 KiB for framing overhead. Extracted text is limited to 100,000 characters, PDFs to 200 pages, and generated documents to 128 chunks."
+    },
+    {
+      "ref": "chunking",
+      "document_id": "6bced508-dee2-532e-a4a3-83a17b7786d3",
+      "chunk_id": "6bced508-dee2-532e-a4a3-83a17b7786d3:chunk:0:0:204",
+      "source_type": "text",
+      "filename": "chunking_rules.txt",
+      "title": "Chunking rules",
+      "text": "Document text is split into chunks of 1,200 characters with 150 characters of overlap. The chunker prefers paragraph boundaries, then sentence boundaries, then word boundaries, and records source offsets."
+    },
+    {
+      "ref": "retrieval",
+      "document_id": "8e81c704-4a20-5960-8930-5d7255d8baea",
+      "chunk_id": "8e81c704-4a20-5960-8930-5d7255d8baea:chunk:0:0:207",
+      "source_type": "text",
+      "filename": "retrieval_rules.txt",
+      "title": "Retrieval rules",
+      "text": "PageGlance retrieves five nearest chunks by PostgreSQL pgvector cosine similarity by default. It caps top-k overrides at 50 and applies source URL and document filters before sorting and limiting candidates."
+    },
+    {
+      "ref": "ocr",
+      "document_id": "beba7545-0b6c-5a7a-8fba-4adbbf9e8a15",
+      "chunk_id": "beba7545-0b6c-5a7a-8fba-4adbbf9e8a15:chunk:0:0:241",
+      "source_type": "text",
+      "filename": "ocr_rules.txt",
+      "title": "OCR limits",
+      "text": "Scanned PDF pages use PyMuPDF rendering and pytesseract to run the local Tesseract OCR executable. Pages with meaningful selectable text skip OCR. OCR is capped at 50 pages, 20 megapixels per page, 20 seconds per page, and 180 seconds total."
+    },
+    {
+      "ref": "extension",
+      "document_id": "f2a087ff-385a-5606-b59d-cf7f2f9be636",
+      "chunk_id": "f2a087ff-385a-5606-b59d-cf7f2f9be636:chunk:0:0:176",
+      "source_type": "text",
+      "filename": "extension_architecture.txt",
+      "title": "Extension architecture",
+      "text": "The Chrome extension uses React, TypeScript, Vite, and Manifest V3. Its content script extracts page title, URL, and readable body text, then sends typed messages to the popup."
+    },
+    {
+      "ref": "database",
+      "document_id": "569e7f39-5f27-58ed-9463-2ab2821964cd",
+      "chunk_id": "569e7f39-5f27-58ed-9463-2ab2821964cd:chunk:0:0:157",
+      "source_type": "text",
+      "filename": "database_storage.txt",
+      "title": "Database storage",
+      "text": "PageGlance stores documents and chunks in PostgreSQL through SQLAlchemy. Alembic manages schema changes, and pgvector provides vector columns for embeddings."
+    },
+    {
+      "ref": "history",
+      "document_id": "4a573818-fc5e-599c-aebd-d59df78434e7",
+      "chunk_id": "4a573818-fc5e-599c-aebd-d59df78434e7:chunk:0:0:188",
+      "source_type": "text",
+      "filename": "conversation_history.txt",
+      "title": "Conversation history",
+      "text": "The chat interface persists drafts, messages, and themes in Chrome local storage. Webpage conversations are separated by normalized page URL, while document conversations use document IDs."
+    },
+    {
+      "ref": "active_page",
+      "document_id": "94c98b7d-eb8a-59c6-8efa-8204631889c4",
+      "chunk_id": "94c98b7d-eb8a-59c6-8efa-8204631889c4:chunk:0:0:90",
+      "source_type": "webpage",
+      "source_url": "https://eval.pageglance.invalid/active",
+      "title": "Active evaluation page",
+      "text": "The active page says the blue widget valve is made of brass and should be checked monthly."
+    },
+    {
+      "ref": "unrelated_page",
+      "document_id": "085314c4-0953-51a3-89d7-49989825424b",
+      "chunk_id": "085314c4-0953-51a3-89d7-49989825424b:chunk:0:0:93",
+      "source_type": "webpage",
+      "source_url": "https://eval.pageglance.invalid/unrelated",
+      "title": "Unrelated evaluation page",
+      "text": "The unrelated page says the red widget handle is made of steel and should be replaced yearly."
+    }
+  ],
+  "cases": [
+    {
+      "id": "exact-model-identifier",
+      "category": "exact_identifier",
+      "question": "What is the exact identifier of the local embedding model?",
+      "scope": { "source_type": "text" },
+      "relevant_chunk_ids": ["55cfc5f5-05ab-5fe4-9270-d557d88ca70b:chunk:0:0:260"],
+      "reference_facts": ["sentence-transformers/all-MiniLM-L6-v2", "384 dimensions"],
+      "expected_citations": ["55cfc5f5-05ab-5fe4-9270-d557d88ca70b:chunk:0:0:260"],
+      "expected_abstention": false
+    },
+    {
+      "id": "numeric-vector-profile",
+      "category": "numeric_specification",
+      "question": "How wide are the vectors, and how many texts are embedded in one batch at most?",
+      "scope": { "source_type": "text" },
+      "relevant_chunk_ids": ["55cfc5f5-05ab-5fe4-9270-d557d88ca70b:chunk:0:0:260"],
+      "reference_facts": ["384 dimensions", "64 texts per batch"],
+      "expected_citations": ["55cfc5f5-05ab-5fe4-9270-d557d88ca70b:chunk:0:0:260"],
+      "expected_abstention": false
+    },
+    {
+      "id": "numeric-upload-bounds",
+      "category": "numeric_specification",
+      "question": "What are the upload file limit and extra multipart allowance?",
+      "scope": { "source_type": "text" },
+      "relevant_chunk_ids": ["89a8d2a4-ebc9-570b-8bba-c6cd95c14143:chunk:0:0:210"],
+      "reference_facts": ["25 MiB per file", "256 KiB multipart overhead"],
+      "expected_citations": ["89a8d2a4-ebc9-570b-8bba-c6cd95c14143:chunk:0:0:210"],
+      "expected_abstention": false
+    },
+    {
+      "id": "paraphrase-chunk-boundary",
+      "category": "paraphrase",
+      "question": "How does splitting preserve nearby context without cutting sentences or paragraphs arbitrarily?",
+      "scope": { "source_type": "text" },
+      "relevant_chunk_ids": ["6bced508-dee2-532e-a4a3-83a17b7786d3:chunk:0:0:204"],
+      "reference_facts": ["1,200-character chunks", "150-character overlap", "paragraph then sentence then word boundaries"],
+      "expected_citations": ["6bced508-dee2-532e-a4a3-83a17b7786d3:chunk:0:0:204"],
+      "expected_abstention": false
+    },
+    {
+      "id": "paraphrase-page-ranking",
+      "category": "paraphrase",
+      "question": "How are the closest passages found without returning material from another page?",
+      "scope": { "source_type": "text" },
+      "relevant_chunk_ids": ["8e81c704-4a20-5960-8930-5d7255d8baea:chunk:0:0:207"],
+      "reference_facts": ["pgvector cosine similarity", "source URL and document filters before ranking"],
+      "expected_citations": ["8e81c704-4a20-5960-8930-5d7255d8baea:chunk:0:0:207"],
+      "expected_abstention": false
+    },
+    {
+      "id": "unsupported-author",
+      "category": "unsupported",
+      "question": "Who originally created the PageGlance product?",
+      "scope": { "source_type": "text" },
+      "relevant_chunk_ids": [],
+      "reference_facts": [],
+      "expected_citations": [],
+      "expected_abstention": true
+    },
+    {
+      "id": "active-url-isolation",
+      "category": "source_isolation",
+      "question": "What material is used for the valve described on this page?",
+      "scope": { "source_url": "https://eval.pageglance.invalid/active" },
+      "relevant_chunk_ids": ["94c98b7d-eb8a-59c6-8efa-8204631889c4:chunk:0:0:90"],
+      "reference_facts": ["The blue widget valve is made of brass"],
+      "expected_citations": ["94c98b7d-eb8a-59c6-8efa-8204631889c4:chunk:0:0:90"],
+      "expected_abstention": false,
+      "forbidden_document_ids": ["085314c4-0953-51a3-89d7-49989825424b"]
+    }
+  ]
+}

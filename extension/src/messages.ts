@@ -16,8 +16,23 @@ export type ExtractPageResponse =
 
 export interface AskRequest {
   question: string
-  page: PageContext
+  page?: PageContext
+  document_id?: string
+  document_ids?: string[]
   history?: AskHistoryMessage[]
+}
+
+export interface AnswerSource {
+  id: string
+  document_id: string
+  title: string
+  source_type: string
+  filename?: string | null
+  source_url?: string | null
+  page_start?: number | null
+  page_end?: number | null
+  page_numbers?: number[]
+  snippet?: string | null
 }
 
 export interface AskHistoryMessage {
@@ -27,4 +42,5 @@ export interface AskHistoryMessage {
 
 export interface AskResponse {
   answer: string
+  sources?: AnswerSource[]
 }

@@ -1,4 +1,5 @@
 import type { AskResponse } from './messages'
+import { parseAnswerSources } from './chat.ts'
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
@@ -20,7 +21,8 @@ export function parseAskResponse(payload: unknown): AskResponse {
     // Ordinary answer text is the expected case; preserve it unchanged.
   }
 
-  return { answer }
+  const sources = parseAnswerSources(payload.sources)
+  return { answer, ...(sources ? { sources } : {}) }
 }
 
 function isStringRecord(value: unknown): value is Record<string, string> {
@@ -35,6 +37,8 @@ function isStringRecord(value: unknown): value is Record<string, string> {
 export async function consumeAnswerStream(
   response: Response,
   onText: (text: string) => void,
+  onSources?: (sources: NonNullable<AskResponse['sources']>) => void,
+  onReplace?: (answer: string) => void,
 ): Promise<void> {
   if (!response.body) throw new Error('The backend returned an empty answer stream.')
 
@@ -77,6 +81,28 @@ export async function consumeAnswerStream(
           ? payload.detail
           : 'The language model stream failed.',
       )
+    } else if (event === 'sources') {
+      let payload: unknown
+      try {
+        payload = JSON.parse(payloadText)
+      } catch {
+        throw new Error('The backend sent invalid source citations.')
+      }
+      if (!isObject(payload) || !Array.isArray(payload.sources)) {
+        throw new Error('The backend sent invalid source citations.')
+      }
+      onSources?.(parseAnswerSources(payload.sources) ?? [])
+    } else if (event === 'replace') {
+      let payload: unknown
+      try {
+        payload = JSON.parse(payloadText)
+      } catch {
+        throw new Error('The backend sent an invalid answer replacement.')
+      }
+      if (!isObject(payload) || typeof payload.answer !== 'string') {
+        throw new Error('The backend sent an invalid answer replacement.')
+      }
+      onReplace?.(payload.answer)
     } else if (event === 'done') {
       completed = true
     }
