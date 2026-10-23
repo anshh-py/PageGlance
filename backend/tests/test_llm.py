@@ -145,7 +145,9 @@ def test_rag_prompt_includes_citable_source_metadata_and_untrusted_data_rules() 
 
     messages = llm._build_messages("What is the fact?", VALID_PAGE, [], sources)
 
-    assert "cite those IDs" in messages[0]["content"]
+    assert "For every factual claim" in messages[0]["content"]
+    assert "literal ASCII square brackets" in messages[0]["content"]
+    assert 'exact citation ID in its "id" field' in messages[0]["content"]
     assert "untrusted external data" in " ".join(messages[0]["content"].split())
     payload = json.loads(messages[-1]["content"].split("\n", 1)[1])
     assert payload["retrieved_sources"] == sources

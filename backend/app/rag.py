@@ -1,5 +1,6 @@
 """Coordinate scoped retrieval and grounded context preparation for chat routes."""
 
+import hashlib
 import logging
 import re
 from collections.abc import Callable
@@ -49,11 +50,13 @@ def _retrieve_scoped_chunks(
     with session_factory() as session:
         retriever = VectorRetriever(session)
         scope: dict[str, object] = {
-            "source_url": None if document_id or document_ids else source_url
+            "source_url": None
+            if document_id is not None or document_ids is not None
+            else source_url,
         }
-        if document_id:
+        if document_id is not None:
             scope["document_id"] = document_id
-        if document_ids:
+        if document_ids is not None:
             scope["document_ids"] = document_ids
         return retriever.retrieve(question, **scope)
 
@@ -97,6 +100,22 @@ def _merge_retry_results(rankings: list[list[RetrievedChunk]]) -> list[Retrieved
     )[:MAX_PREPARED_SOURCES]
 
 
+def _safe_scope_fields(
+    document_id: str | None, document_ids: list[str] | None, source_url: str | None
+) -> dict[str, object]:
+    """Describe retrieval scope without logging a potentially private page URL."""
+    if document_id is not None:
+        return {"scope_type": "document", "document_id": document_id}
+    if document_ids is not None:
+        return {
+            "scope_type": "documents",
+            "document_ids": document_ids,
+            "document_count": len(document_ids),
+        }
+    url_digest = hashlib.sha256(source_url.encode("utf-8")).hexdigest()[:12] if source_url else None
+    return {"scope_type": "page" if source_url else "unscoped", "source_scope_hash": url_digest}
+
+
 class RagOrchestrator:
     """Build RAG context, falling back to selected active-page context safely."""
 
@@ -120,17 +139,24 @@ class RagOrchestrator:
         """Retrieve only from the page/document scope and preserve the page fallback."""
         selected_page = select_page_context(question, page, context_limit)
         source_url = page.get("url", "").strip() or None
+        safe_scope = _safe_scope_fields(document_id, document_ids, source_url)
         if not retrieval_enabled:
             code = fallback_code or "no_indexed_content"
-            logger.info("rag_fallback code=%s page_text_chars=%d", code, len(page.get("text", "")))
+            logger.info(
+                "rag_fallback code=%s page_text_chars=%d scope=%s results=0",
+                code,
+                len(page.get("text", "")),
+                safe_scope,
+            )
             return PreparedAnswerContext(selected_page, None, False, code)
         try:
             scope: dict[str, object] = {
                 "document_id": document_id,
-                "source_url": None if document_id or document_ids else source_url,
+                "document_ids": document_ids,
+                "source_url": None
+                if document_id is not None or document_ids is not None
+                else source_url,
             }
-            if document_ids is not None:
-                scope["document_ids"] = document_ids
             chunks = self.retrieve(question, **scope)
         except (
             DatabaseConfigurationError,
@@ -140,7 +166,12 @@ class RagOrchestrator:
         ) as error:
             # Do not expose database/provider exception details in fallback logs or responses.
             code = getattr(error, "code", "retrieval_unavailable")
-            logger.info("rag_fallback code=%s page_text_chars=%d", code, len(page.get("text", "")))
+            logger.info(
+                "rag_fallback code=%s page_text_chars=%d scope=%s results=0",
+                code,
+                len(page.get("text", "")),
+                safe_scope,
+            )
             return PreparedAnswerContext(selected_page, None, False, code)
 
         if not chunks:
@@ -164,8 +195,9 @@ class RagOrchestrator:
                     logger.info("rag_adaptive_retry_failed code=retry_unavailable")
             if not chunks:
                 logger.info(
-                    "rag_fallback code=no_indexed_content page_text_chars=%d",
+                    "rag_fallback code=no_indexed_content page_text_chars=%d scope=%s results=0",
                     len(page.get("text", "")),
+                    safe_scope,
                 )
                 return PreparedAnswerContext(selected_page, None, False, "no_indexed_content")
         else:
@@ -204,8 +236,18 @@ class RagOrchestrator:
             for index, chunk in enumerate(chunks, start=1)
         ]
         logger.info(
-            "rag_retrieval_used sources=%d page_text_chars=%d",
+            "rag_retrieval_used scope=%s results=%d retrieved=%s page_text_chars=%d",
+            safe_scope,
             len(sources),
+            [
+                {
+                    "rank": rank,
+                    "chunk_id": source["chunk_id"],
+                    "source_id": source["id"],
+                    "similarity": source["similarity"],
+                }
+                for rank, source in enumerate(sources, start=1)
+            ],
             len(page.get("text", "")),
         )
         return PreparedAnswerContext(selected_page, sources, True)

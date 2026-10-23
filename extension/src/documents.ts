@@ -4,7 +4,6 @@ import { parseChatMessage, type ChatMessage } from './chat.ts'
 export const DOCUMENT_LIBRARY_KEY = 'pageGlanceUploadedDocuments'
 export const DOCUMENT_CHAT_STORE_KEY = 'pageGlanceDocumentConversations'
 export const MAX_SAVED_DOCUMENTS = 30
-export const MAX_FILE_BYTES = 25 * 1024 * 1024
 const DOCUMENT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 export interface UploadedDocument {
@@ -101,7 +100,6 @@ export async function uploadDocument(
     throw new Error('Choose a .txt or .pdf file.')
   }
   if (file.size === 0) throw new Error('The selected file is empty.')
-  if (file.size > MAX_FILE_BYTES) throw new Error('Files must be 25 MiB or smaller.')
 
   const body = new FormData()
   body.append('file', file, file.name)

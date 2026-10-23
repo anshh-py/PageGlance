@@ -5,10 +5,13 @@ import logging
 import math
 import os
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import BinaryIO
 
+from dotenv import load_dotenv
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -20,18 +23,97 @@ from app.ingestion import ingest_text
 from app.normalization import normalize_text
 from app.page_indexing import get_ingestion_embedding_service, get_ingestion_session_factory
 from app.repository import DocumentRepository
+from app.upload_limits import get_max_upload_bytes, get_max_upload_mb
 
 logger = logging.getLogger(__name__)
-MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_UPLOAD_BYTES = get_max_upload_bytes()
 MAX_EXTRACTED_TEXT_CHARS = 100_000
 MAX_UPLOAD_CHUNKS = 128
 MAX_PDF_PAGES = 200
-MAX_OCR_PAGES = 50
+MAX_OCR_PAGES = MAX_PDF_PAGES
 MAX_OCR_PIXELS_PER_PAGE = 20_000_000
 MAX_OCR_PAGE_SECONDS = 20
-MAX_OCR_TOTAL_SECONDS = 180
+MAX_OCR_TOTAL_SECONDS = 900
+OCR_BATCH_PAGES = 4
+MAX_CONFIGURED_OCR_SECONDS = 3600
 MAX_OCR_DPI = 150
 MAX_FILENAME_CHARS = 255
+DEFAULT_TESSERACT_COMMAND = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+
+def _configured_ocr_limit(name: str, default: int, maximum: int) -> int:
+    """Read an integer OCR limit from the repository environment with hard bounds."""
+    env_file = os.path.join(os.path.dirname(__file__), "..", "..", ".env")
+    load_dotenv(dotenv_path=os.path.abspath(env_file), override=False)
+    raw_value = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw_value)
+    except ValueError:
+        logger.warning("pdf_ocr_configuration_invalid setting=%s reason=not_integer", name)
+        return default
+    if not 1 <= value <= maximum:
+        logger.warning(
+            "pdf_ocr_configuration_invalid setting=%s reason=out_of_range max=%d", name, maximum
+        )
+        return default
+    return value
+
+
+def get_max_ocr_pages() -> int:
+    """Return the bounded number of scanned pages allowed in one PDF."""
+    return min(_configured_ocr_limit("PAGEGLANCE_MAX_OCR_PAGES", MAX_OCR_PAGES, MAX_PDF_PAGES), MAX_PDF_PAGES)
+
+
+def get_max_ocr_seconds() -> int:
+    """Return the bounded wall-time budget for OCR in one PDF."""
+    return _configured_ocr_limit(
+        "PAGEGLANCE_MAX_OCR_SECONDS", MAX_OCR_TOTAL_SECONDS, MAX_CONFIGURED_OCR_SECONDS
+    )
+
+
+def _upload_size(content: bytes | BinaryIO) -> int:
+    if isinstance(content, bytes):
+        return len(content)
+    position = content.tell()
+    content.seek(0, os.SEEK_END)
+    size = content.tell()
+    content.seek(position)
+    return size
+
+
+def _read_upload_range(content: bytes | BinaryIO, start: int, length: int) -> bytes:
+    if isinstance(content, bytes):
+        return content[start : start + length]
+    position = content.tell()
+    content.seek(start)
+    value = content.read(length)
+    content.seek(position)
+    return value
+
+
+def _copy_upload_to_temp(content: bytes | BinaryIO) -> str:
+    """Copy a PDF to a temporary file in bounded blocks for PyMuPDF OCR rendering."""
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(prefix="pageglance-ocr-", suffix=".pdf", delete=False) as out:
+            temp_path = out.name
+            if isinstance(content, bytes):
+                source: BinaryIO = io.BytesIO(content)
+            else:
+                source = content
+            original_position = source.tell()
+            source.seek(0)
+            while block := source.read(1024 * 1024):
+                out.write(block)
+            source.seek(original_position)
+        return temp_path
+    except Exception:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+        raise
 
 
 class UploadValidationError(ValueError):
@@ -117,13 +199,12 @@ def _load_ocr_tools():
         import pytesseract
     except ImportError:
         raise UploadProcessingError(
-            "ocr_engine_unavailable",
+            "pytesseract_unavailable",
             "Scanned PDF processing is unavailable because pytesseract is not installed.",
         ) from None
 
     configured_command = os.getenv("PAGEGLANCE_TESSERACT_CMD", "").strip()
-    if configured_command:
-        pytesseract.pytesseract.tesseract_cmd = configured_command
+    pytesseract.pytesseract.tesseract_cmd = configured_command or DEFAULT_TESSERACT_COMMAND
     return fitz, pytesseract
 
 
@@ -151,8 +232,9 @@ def _ocr_pdf_page(pdf_page, fitz, pytesseract, timeout_seconds: float) -> str:
         ) from None
     except getattr(pytesseract, "TesseractNotFoundError", ()):
         raise UploadProcessingError(
-            "ocr_engine_unavailable",
-            "Local OCR is unavailable. Install Tesseract OCR and ensure it is on PATH.",
+            "tesseract_executable_unavailable",
+            "Tesseract OCR could not be started. Set PAGEGLANCE_TESSERACT_CMD to the "
+            "executable path or ensure Tesseract is on PATH.",
         ) from None
     except subprocess.TimeoutExpired:
         raise UploadProcessingError(
@@ -167,23 +249,33 @@ def _ocr_pdf_page(pdf_page, fitz, pytesseract, timeout_seconds: float) -> str:
 
 def extract_uploaded_text(
     filename: str | None,
-    content: bytes,
+    content: bytes | BinaryIO,
 ) -> ExtractedUpload:
-    """Extract UTF-8 TXT or PDF text, using bounded local OCR for scanned pages."""
+    """Extract text incrementally, using bounded local OCR only for scanned PDF pages."""
     safe_name = _safe_filename(filename)
-    if not content:
+    file_size = _upload_size(content)
+    if not file_size:
         raise UploadValidationError("empty_file", "The uploaded file is empty.")
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise UploadValidationError("file_too_large", "Files must be 25 MiB or smaller.", 413)
+    if file_size > get_max_upload_bytes():
+        raise UploadValidationError(
+            "file_too_large",
+            f"Files must be {get_max_upload_mb()} MiB or smaller.",
+            413,
+        )
 
     suffix = safe_name.rsplit(".", 1)[-1].lower() if "." in safe_name else ""
     if suffix == "txt":
-        if content.startswith(b"%PDF-"):
+        if _read_upload_range(content, 0, 5).startswith(b"%PDF-"):
             raise UploadValidationError(
                 "file_type_mismatch", "The file content does not match TXT."
             )
         try:
-            text = content.decode("utf-8-sig", errors="strict")
+            if isinstance(content, bytes):
+                raw_text = content
+            else:
+                content.seek(0)
+                raw_text = content.read(get_max_upload_bytes() + 1)
+            text = raw_text.decode("utf-8-sig", errors="strict")
         except UnicodeDecodeError:
             raise UploadValidationError(
                 "invalid_text_encoding", "TXT uploads must use UTF-8 encoding."
@@ -199,23 +291,26 @@ def extract_uploaded_text(
             source_type="text",
             media_type="text/plain",
             text=normalized,
-            metadata={"upload_filename": safe_name, "size_bytes": len(content)},
+            metadata={"upload_filename": safe_name, "size_bytes": file_size},
         )
 
     if suffix != "pdf":
         raise UploadValidationError(
             "unsupported_file_type", "Only .txt and text-based .pdf files are supported.", 415
         )
-    if not content.startswith(b"%PDF-"):
+    if not _read_upload_range(content, 0, 5).startswith(b"%PDF-"):
         raise UploadValidationError("invalid_pdf", "The PDF file signature is invalid.")
-    if b"%%EOF" not in content[-1024:]:
+    if b"%%EOF" not in _read_upload_range(content, max(file_size - 1024, 0), 1024):
         raise UploadValidationError("invalid_pdf", "The PDF file is malformed or unreadable.")
 
     ocr_pdf = None
+    ocr_temp_path: str | None = None
     try:
         from pypdf import PdfReader
 
-        reader = PdfReader(io.BytesIO(content), strict=True)
+        pdf_source: BinaryIO = io.BytesIO(content) if isinstance(content, bytes) else content
+        pdf_source.seek(0)
+        reader = PdfReader(pdf_source, strict=True)
         if reader.is_encrypted:
             raise UploadValidationError(
                 "encrypted_pdf", "Password-protected PDF files are not supported."
@@ -234,21 +329,23 @@ def extract_uploaded_text(
         total_chars = 0
         ocr_page_count = 0
         ocr_started: float | None = None
+        max_ocr_pages = get_max_ocr_pages()
+        max_ocr_seconds = get_max_ocr_seconds()
         ocr_tools = None
         for page_number, page in enumerate(reader.pages, start=1):
             page_text = normalize_text(page.extract_text() or "")
             if not _has_meaningful_pdf_text(page_text):
                 ocr_page_count += 1
-                if ocr_page_count > MAX_OCR_PAGES:
+                if ocr_page_count > max_ocr_pages:
                     raise UploadValidationError(
                         "pdf_ocr_page_limit_exceeded",
-                        f"PDF uploads may OCR at most {MAX_OCR_PAGES} scanned pages.",
+                        f"PDF uploads may OCR at most {max_ocr_pages} scanned pages.",
                         413,
                     )
                 if ocr_started is None:
                     ocr_started = time.monotonic()
                 elapsed = time.monotonic() - ocr_started
-                remaining = MAX_OCR_TOTAL_SECONDS - elapsed
+                remaining = max_ocr_seconds - elapsed
                 if remaining <= 0:
                     raise UploadValidationError(
                         "pdf_ocr_time_limit_exceeded",
@@ -259,7 +356,8 @@ def extract_uploaded_text(
                     ocr_tools = _load_ocr_tools()
                     fitz, _pytesseract = ocr_tools
                     try:
-                        ocr_pdf = fitz.open(stream=content, filetype="pdf")
+                        ocr_temp_path = _copy_upload_to_temp(content)
+                        ocr_pdf = fitz.open(filename=ocr_temp_path)
                     except Exception:
                         raise UploadProcessingError(
                             "pdf_renderer_unavailable",
@@ -280,6 +378,15 @@ def extract_uploaded_text(
                         min(MAX_OCR_PAGE_SECONDS, remaining),
                     )
                 )
+                if not page_text:
+                    logger.warning(
+                        "pdf_page_no_readable_text page_number=%d action=reject_upload", page_number
+                    )
+                    raise UploadValidationError(
+                        "pdf_page_no_readable_text",
+                        f"No readable text could be extracted from PDF page {page_number}.",
+                        422,
+                    )
             total_chars += len(page_text) + (2 if page_texts and page_text else 0)
             if total_chars > MAX_EXTRACTED_TEXT_CHARS:
                 raise UploadValidationError(
@@ -289,6 +396,16 @@ def extract_uploaded_text(
                 )
             if page_text:
                 page_texts.append((page_number, page_text))
+            processed = page_number
+            if processed % OCR_BATCH_PAGES == 0 or processed == page_count:
+                logger.info(
+                    "pdf_extraction_progress pages_processed=%d page_count=%d ocr_pages=%d "
+                    "extracted_chars=%d",
+                    processed,
+                    page_count,
+                    ocr_page_count,
+                    total_chars,
+                )
     except (UploadValidationError, UploadProcessingError):
         raise
     except ImportError:
@@ -304,6 +421,11 @@ def extract_uploaded_text(
     finally:
         if ocr_pdf is not None:
             ocr_pdf.close()
+        if ocr_temp_path is not None:
+            try:
+                os.unlink(ocr_temp_path)
+            except OSError:
+                logger.warning("pdf_ocr_temp_cleanup_failed")
 
     if not page_texts:
         raise UploadValidationError(
@@ -332,7 +454,7 @@ def extract_uploaded_text(
         text=combined,
         metadata={
             "upload_filename": safe_name,
-            "size_bytes": len(content),
+            "size_bytes": file_size,
             "page_count": page_count,
         },
         page_ranges=tuple(page_ranges),
@@ -357,7 +479,7 @@ def _add_page_references(extracted: ExtractedUpload, result) -> None:
 
 def ingest_uploaded_file(
     filename: str | None,
-    content: bytes,
+    content: bytes | BinaryIO,
     *,
     session_factory: Callable[[], Session] | None = None,
     embedding_service: EmbeddingService | None = None,
@@ -372,6 +494,12 @@ def ingest_uploaded_file(
         metadata=extracted.metadata,
     )
     _add_page_references(extracted, result)
+    logger.info(
+        "document_extracted source_type=%s extracted_chars=%d chunk_count=%d",
+        extracted.source_type,
+        len(extracted.text),
+        len(result.chunks),
+    )
     if len(result.chunks) > MAX_UPLOAD_CHUNKS:
         raise UploadValidationError(
             "document_chunk_limit_exceeded",
@@ -392,6 +520,12 @@ def ingest_uploaded_file(
             )
             stored = repository.get_by_id(saved.id)
             chunk_count = len(stored.chunks) if stored is not None else len(result.chunks)
+        logger.info(
+            "document_indexed document_id=%s indexing_status=indexed chunk_count=%d duplicate=%s",
+            saved.id,
+            chunk_count,
+            duplicate,
+        )
         return UploadedDocument(
             document=saved,
             chunk_count=chunk_count,
@@ -407,12 +541,12 @@ def ingest_uploaded_file(
             code = "database_unavailable"
         else:
             code = getattr(error, "code", "document_ingestion_unavailable")
-        logger.warning("document_ingestion_failed code=%s file_bytes=%d", code, len(content))
+        logger.warning("document_ingestion_failed code=%s file_bytes=%d", code, _upload_size(content))
         raise UploadProcessingError(code) from None
     except Exception:
         # Provider adapters may raise SDK-specific exceptions; keep their details private.
         logger.warning(
             "document_ingestion_failed code=document_ingestion_unavailable file_bytes=%d",
-            len(content),
+            _upload_size(content),
         )
         raise UploadProcessingError() from None

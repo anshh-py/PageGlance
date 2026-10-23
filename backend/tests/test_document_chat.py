@@ -6,11 +6,17 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from app import main
 from app.documents import Document, DocumentChunk, IngestionResult
 from app.llm import LLMSettings
-from app.rag import PreparedAnswerContext
+from app.models import Base
+from app.rag import PreparedAnswerContext, RagOrchestrator
+from app.repository import DocumentRepository
+from app.retrieval import RetrievedChunk
 
 client = TestClient(main.app)
 
@@ -113,6 +119,253 @@ def test_document_ask_uses_exact_validated_scope_and_returns_page_citation(monke
             True,
         )
     ]
+
+
+def test_document_stats_returns_persisted_chunk_and_page_metadata(monkeypatch) -> None:
+    document_id = str(uuid4())
+    configure_document(monkeypatch, stored_document(document_id))
+
+    response = client.get(f"/documents/{document_id}/stats")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "document_id": document_id,
+        "filename": "source.pdf",
+        "source_type": "pdf",
+        "indexed_chunk_count": 1,
+        "chunks": [
+            {
+                "chunk_id": f"{document_id}:chunk:0",
+                "chunk_index": 0,
+                "start_char": 0,
+                "end_char": 19,
+                "page_numbers": [3],
+                "page_start": 3,
+                "page_end": 3,
+            }
+        ],
+    }
+
+
+def test_document_stats_hides_missing_and_webpage_records(monkeypatch) -> None:
+    document_id = str(uuid4())
+    webpage_id = str(uuid4())
+    configure_document(monkeypatch, stored_document(webpage_id, source_type="webpage"))
+
+    missing = client.get(f"/documents/{document_id}/stats")
+    webpage = client.get(f"/documents/{webpage_id}/stats")
+
+    assert missing.status_code == 404
+    assert webpage.status_code == 404
+
+
+def test_document_diagnostic_ask_uses_database_metadata_without_llm(monkeypatch) -> None:
+    document_id = str(uuid4())
+    document = stored_document(document_id)
+    configure_document(monkeypatch, document)
+    citation = {
+        "id": "S1",
+        "document_id": document_id,
+        "chunk_id": document.chunks[0].id,
+        "chunk_index": 0,
+        "chunk_metadata": document.chunks[0].metadata,
+        "text": "Stored source text.",
+    }
+
+    class FakeRag:
+        def prepare(self, _question, page, **_kwargs):
+            return PreparedAnswerContext(page, [citation], True)
+
+    def llm_must_not_run():
+        pytest.fail("Document diagnostics must be answered from persisted metadata.")
+
+    monkeypatch.setattr(main, "rag_orchestrator", FakeRag())
+    monkeypatch.setattr(main, "get_context_max_chars", lambda: 16000)
+    monkeypatch.setattr(main, "get_answer_service", llm_must_not_run)
+    response = client.post(
+        "/ask",
+        json={
+            "question": "How many chunks are indexed? List their chunk IDs and page ranges.",
+            "document_id": document_id,
+        },
+    )
+
+    assert response.status_code == 200
+    answer = response.json()["answer"]
+    assert "Indexed chunks in this document: 1." in answer
+    assert "Chunks retrieved for this question: 1." in answer
+    assert document.chunks[0].id in answer
+    assert "pages 3" in answer
+    assert response.json().get("sources") is None
+
+
+def test_streamed_document_diagnostic_uses_metadata_without_groq(monkeypatch) -> None:
+    document_id = str(uuid4())
+    document = stored_document(document_id)
+    configure_document(monkeypatch, document)
+    chunk = document.chunks[0]
+    source = {
+        "id": "S1",
+        "document_id": document_id,
+        "chunk_id": chunk.id,
+        "chunk_index": chunk.index,
+        "chunk_metadata": chunk.metadata,
+        "text": chunk.text,
+    }
+
+    class FakeRag:
+        def prepare(self, _question, page, **_kwargs):
+            return PreparedAnswerContext(page, [source], True)
+
+    async def groq_must_not_run(*_args, **_kwargs):
+        pytest.fail("Document diagnostics must not be sent to Groq.")
+
+    monkeypatch.setattr(main, "rag_orchestrator", FakeRag())
+    monkeypatch.setattr(main, "get_settings", lambda: LLMSettings("test-key", "test-model", 2, 64))
+    monkeypatch.setattr(main, "stream_answer", groq_must_not_run)
+    response = client.post(
+        "/ask/stream",
+        json={"question": "What are the chunk IDs and page ranges?", "document_id": document_id},
+    )
+
+    assert response.status_code == 200
+    assert 'event: token\ndata: {"text": "Indexed chunks in this document: 1.' in response.text
+    assert chunk.id in response.text
+    assert "pages 3" in response.text
+    assert "event: done" in response.text
+
+
+def test_unique_fact_upload_extraction_retrieval_and_grounding(monkeypatch, caplog) -> None:
+    """Exercise upload persistence through document-scoped RAG and citation validation."""
+    from app import document_ingestion
+
+    caplog.set_level("INFO")
+    fact = "The calibration key is ORCHID-7319 and the safe temperature is 17 C."
+    engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+
+    class FakeEmbeddingService:
+        model_version = "test:document-chat:dimensions=3"
+        dimensions = 3
+
+        @staticmethod
+        def embed_texts(texts):
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+    monkeypatch.setattr(document_ingestion, "get_ingestion_session_factory", lambda: factory)
+    monkeypatch.setattr(
+        document_ingestion,
+        "get_ingestion_embedding_service",
+        lambda: FakeEmbeddingService(),
+    )
+    monkeypatch.setattr(main, "get_ingestion_session_factory", lambda: factory)
+    upload = client.post(
+        "/documents/upload",
+        files={"file": ("calibration.txt", fact.encode("utf-8"), "text/plain")},
+    )
+    assert upload.status_code == 200
+    document_id = upload.json()["document_id"]
+    scopes = []
+
+    def retrieve(_question, *, document_id, document_ids, source_url):
+        scopes.append((document_id, document_ids, source_url))
+        if document_ids is not None or source_url is not None:
+            return []
+        with factory() as session:
+            stored = DocumentRepository(session).get_by_id(document_id)
+        if stored is None:
+            return []
+        return [
+            RetrievedChunk(
+                chunk_id=chunk.id,
+                document_id=document_id,
+                chunk_index=chunk.index,
+                text=chunk.text,
+                start_char=chunk.start_char,
+                end_char=chunk.end_char,
+                title=stored.document.title,
+                source_type=stored.document.source_type,
+                source_url=None,
+                filename=stored.document.filename,
+                document_metadata=stored.document.metadata,
+                chunk_metadata=chunk.metadata,
+                similarity=0.91,
+            )
+            for chunk in stored.chunks
+            if document_id == upload.json()["document_id"]
+        ]
+
+    class FakeAnswer:
+        def answer(self, question, page, history, sources):
+            assert "ORCHID-7319" in sources[0]["text"]
+            assert page["text"] == ""
+            return "The calibration key is ORCHID-7319, and the safe temperature is 17 C. [S1]"
+
+    monkeypatch.setattr(main, "rag_orchestrator", RagOrchestrator(retrieve))
+    monkeypatch.setattr(main, "get_context_max_chars", lambda: 16000)
+    monkeypatch.setattr(main, "get_history_limits", lambda: (10, 12000))
+    monkeypatch.setattr(main, "get_answer_service", lambda: FakeAnswer())
+    response = client.post(
+        "/ask", json={"question": "What is the calibration key?", "document_id": document_id}
+    )
+
+    assert response.status_code == 200
+    assert "ORCHID-7319" in response.json()["answer"]
+    assert response.json()["sources"][0]["document_id"] == document_id
+    assert scopes == [(document_id, None, None)]
+    assert "extracted_chars=68 chunk_count=1" in caplog.text
+    assert f"document_indexed document_id={document_id} indexing_status=indexed" in caplog.text
+    assert "scope_type': 'document'" in caplog.text
+    assert upload.json()["document_id"] in caplog.text
+    assert "chunk_id': '" in caplog.text
+    assert "source_id': 'S1'" in caplog.text
+    assert "similarity': 0.91" in caplog.text
+    assert "evidence_context_chars=" in caplog.text
+    assert "reason=valid_citations" in caplog.text
+    assert "ORCHID-7319" not in caplog.text
+    assert fact not in caplog.text
+
+
+def test_uncited_document_answer_reports_validation_reason_and_abstains(
+    monkeypatch, caplog
+) -> None:
+    caplog.set_level("INFO")
+    document_id = str(uuid4())
+    configure_document(monkeypatch, stored_document(document_id))
+    citation = {
+        "id": "S1",
+        "document_id": document_id,
+        "chunk_id": f"{document_id}:chunk:0",
+        "title": "Test source",
+        "source_type": "text",
+        "filename": "source.txt",
+        "chunk_metadata": {},
+        "text": "An unlogged private fact.",
+    }
+
+    class FakeRag:
+        def prepare(self, _question, page, **_kwargs):
+            return PreparedAnswerContext(page, [citation], True)
+
+    class FakeAnswer:
+        def answer(self, *_args):
+            return "The answer is 42."
+
+    monkeypatch.setattr(main, "rag_orchestrator", FakeRag())
+    monkeypatch.setattr(main, "get_context_max_chars", lambda: 16000)
+    monkeypatch.setattr(main, "get_history_limits", lambda: (10, 12000))
+    monkeypatch.setattr(main, "get_answer_service", lambda: FakeAnswer())
+    response = client.post("/ask", json={"question": "What is it?", "document_id": document_id})
+
+    assert response.status_code == 200
+    assert response.json()["answer"] == main._SAFE_GROUNDED_ABSTENTION
+    assert "reason=missing_citations" in caplog.text
+    assert "An unlogged private fact" not in caplog.text
 
 
 @pytest.mark.parametrize(

@@ -76,8 +76,9 @@ def test_ask_indexes_reuses_embeddings_and_keeps_url_scopes_separate(monkeypatch
         )
         return PageIndexResult(True, document_id, 1)
 
-    def retrieve(_question, *, document_id, source_url):
+    def retrieve(_question, *, document_id, document_ids, source_url):
         assert source_url is None
+        assert document_ids is None
         retrieval_scopes.append(document_id)
         return []
 
@@ -121,8 +122,8 @@ def test_retrieval_scope_uses_indexed_active_page_not_request_document_id(monkey
         seen_page_ids.append(page.get("document_id"))
         return PageIndexResult(True, "indexed-active-page", 1)
 
-    def retrieve(_question, *, document_id, source_url):
-        scopes.append((document_id, source_url))
+    def retrieve(_question, *, document_id, document_ids, source_url):
+        scopes.append((document_id, document_ids, source_url))
         return []
 
     monkeypatch.setattr(main, "index_page_context", index_page)
@@ -143,7 +144,7 @@ def test_retrieval_scope_uses_indexed_active_page_not_request_document_id(monkey
 
     assert response.status_code == 200
     assert seen_page_ids == ["unrelated-document"]
-    assert scopes == [("indexed-active-page", None)]
+    assert scopes == [("indexed-active-page", None, None)]
 
 
 def test_indexing_failure_skips_retrieval_and_keeps_fallback_for_both_routes(monkeypatch) -> None:
@@ -234,8 +235,8 @@ def test_ask_passes_scoped_retrieved_sources_and_history_to_answer_service(monke
         main,
         "rag_orchestrator",
         RagOrchestrator(
-            lambda question, *, document_id, source_url: (
-                scopes.append((question, document_id, source_url)) or [chunk]
+            lambda question, *, document_id, document_ids, source_url: (
+                scopes.append((question, document_id, document_ids, source_url)) or [chunk]
             )
         ),
     )
@@ -266,7 +267,7 @@ def test_ask_passes_scoped_retrieved_sources_and_history_to_answer_service(monke
     assert response.json()["answer"] == "The fact is supported. [S1]"
     assert response.json()["sources"][0]["id"] == "S1"
     assert response.json()["sources"][0]["source_url"] == VALID_PAGE["url"]
-    assert scopes == [("What is the fact?", "doc-1", None)]
+    assert scopes == [("What is the fact?", "doc-1", None, None)]
     assert captured["history"] == [{"role": "user", "content": "What did I ask?"}]
     assert captured["retrieved_sources"][0]["id"] == "S1"
     assert captured["retrieved_sources"][0]["source_url"] == VALID_PAGE["url"]
@@ -536,8 +537,8 @@ def test_stream_uses_retrieved_sources_and_preserves_sse_contract(monkeypatch) -
         main,
         "rag_orchestrator",
         RagOrchestrator(
-            lambda question, *, document_id, source_url: (
-                scopes.append((question, document_id, source_url)) or [source_chunk]
+            lambda question, *, document_id, document_ids, source_url: (
+                scopes.append((question, document_id, document_ids, source_url)) or [source_chunk]
             )
         ),
     )
@@ -565,9 +566,10 @@ def test_stream_uses_retrieved_sources_and_preserves_sse_contract(monkeypatch) -
     assert response.status_code == 200
     assert 'event: token\ndata: {"text": "The article supports this. [S1]"}\n\n' in response.text
     assert "event: done" in response.text
-    assert scopes == [("What does the article support?", "doc-2", None)]
+    assert scopes == [("What does the article support?", "doc-2", None, None)]
     submitted = json.loads(requests[0].content)
-    assert "cite those IDs" in submitted["messages"][0]["content"]
+    assert "For every factual claim" in submitted["messages"][0]["content"]
+    assert "literal ASCII square brackets" in submitted["messages"][0]["content"]
     assert submitted["messages"][1]["content"] == "Follow up"
     user_payload = json.loads(submitted["messages"][-1]["content"].split("\n", 1)[1])
     assert user_payload["retrieved_sources"][0]["id"] == "S1"

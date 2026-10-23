@@ -17,7 +17,6 @@ import {
   addUploadedDocument,
   citationItems,
   createScopedAskRequest,
-  MAX_FILE_BYTES,
   parseUploadedDocuments,
   resolveCitationId,
   removeUploadedDocument,
@@ -209,22 +208,15 @@ test('upload API surfaces server validation errors and rejects unsupported types
     ),
     /No readable text was found/,
   )
-  assert.equal(MAX_FILE_BYTES, 25 * 1024 * 1024)
-  await assert.rejects(
-    uploadDocument(
-      { name: 'large.pdf', size: MAX_FILE_BYTES + 1 },
-      'http://localhost:8000',
-    ),
-    /Files must be 25 MiB or smaller/,
-  )
 })
 
-test('upload API accepts a file at the configured 25 MiB boundary', async () => {
+test('upload API does not impose a stale bundled size limit', async () => {
   const file = new File(['small test fixture'], 'boundary.txt')
-  Object.defineProperty(file, 'size', { value: MAX_FILE_BYTES })
   let sent = false
-  await uploadDocument(file, 'http://localhost:8000', async () => {
+  Object.defineProperty(file, 'size', { value: 150 * 1024 * 1024 })
+  await uploadDocument(file, 'http://localhost:8000', async (_url, options) => {
     sent = true
+    assert.equal(options.method, 'POST')
     return Response.json({ ...uploadReply, source_type: 'text' }, { status: 200 })
   })
   assert.equal(sent, true)

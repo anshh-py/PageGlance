@@ -17,7 +17,6 @@ from starlette.concurrency import run_in_threadpool
 
 from app.db import DatabaseConfigurationError
 from app.document_ingestion import (
-    MAX_UPLOAD_BYTES,
     UploadProcessingError,
     UploadValidationError,
     ingest_uploaded_file,
@@ -35,7 +34,7 @@ from app.llm import (
 from app.page_indexing import get_ingestion_session_factory, index_page_context
 from app.rag import rag_orchestrator
 from app.repository import DocumentRepository
-from app.upload_limits import UploadBodyLimitMiddleware
+from app.upload_limits import UploadBodyLimitMiddleware, get_max_upload_bytes, get_max_upload_mb
 from app.url_identity import normalize_page_url
 
 app = FastAPI(title="PageGlance API", version="0.1.0")
@@ -66,8 +65,17 @@ _UPLOAD_ERROR_DETAILS = {
     "pdf_renderer_unavailable": (
         "Scanned PDF processing is unavailable because PyMuPDF could not open or render the file."
     ),
+    "pytesseract_unavailable": (
+        "Scanned PDF OCR requires the pytesseract Python package. Install backend dependencies "
+        "and restart the backend."
+    ),
+    "tesseract_executable_unavailable": (
+        "Tesseract OCR could not be started. Set PAGEGLANCE_TESSERACT_CMD to the full path of "
+        "tesseract.exe or add Tesseract to PATH, then restart the backend."
+    ),
     "ocr_engine_unavailable": (
-        "Local OCR is unavailable. Install pytesseract and Tesseract OCR, then restart the backend."
+        "Local OCR is unavailable. Check the pytesseract package and Tesseract executable "
+        "configuration."
     ),
     "ocr_timeout": "Local OCR took too long to process this PDF. Try a smaller file.",
     "pdf_ocr_failed": "Local OCR could not read a scanned PDF page. Check backend logs and retry.",
@@ -210,6 +218,133 @@ class AskResponse(BaseModel):
     sources: list[AnswerSource] | None = None
 
 
+class DocumentChunkStats(BaseModel):
+    """Index metadata for one stored chunk, with no document text exposed."""
+
+    chunk_id: str
+    chunk_index: int
+    start_char: int
+    end_char: int
+    page_numbers: list[int] = Field(default_factory=list)
+    page_start: int | None = None
+    page_end: int | None = None
+
+
+class DocumentStatsResponse(BaseModel):
+    """Persisted indexing facts for one selected uploaded document."""
+
+    document_id: str
+    filename: str | None
+    source_type: Literal["text", "pdf"]
+    indexed_chunk_count: int
+    chunks: list[DocumentChunkStats]
+
+
+def _document_stats(document) -> DocumentStatsResponse:
+    chunks = []
+    for chunk in document.chunks:
+        metadata = chunk.metadata
+        pages = metadata.get("page_numbers", [])
+        chunks.append(
+            DocumentChunkStats(
+                chunk_id=chunk.id,
+                chunk_index=chunk.index,
+                start_char=chunk.start_char,
+                end_char=chunk.end_char,
+                page_numbers=[page for page in pages if isinstance(page, int)]
+                if isinstance(pages, list)
+                else [],
+                page_start=metadata.get("page_start")
+                if isinstance(metadata.get("page_start"), int)
+                else None,
+                page_end=metadata.get("page_end")
+                if isinstance(metadata.get("page_end"), int)
+                else None,
+            )
+        )
+    return DocumentStatsResponse(
+        document_id=document.document.id,
+        filename=document.document.filename,
+        source_type=document.document.source_type,
+        indexed_chunk_count=len(chunks),
+        chunks=chunks,
+    )
+
+
+def _document_diagnostics_question(question: str) -> bool:
+    pattern = (
+        r"\b(?:how many|total|count|number of)\b.{0,40}\bchunks?\b"
+        r"|\bchunk count\b|\bchunk ids?\b|\bpage ranges?\b|\bpage numbers?\b"
+        r"|\bchunks?\b.{0,40}\b(?:retrieved|indexed|count|total)\b"
+    )
+    return re.search(pattern, question, re.IGNORECASE) is not None
+
+
+def _page_label(numbers: object, start: object, end: object) -> str:
+    if isinstance(start, int) and isinstance(end, int):
+        return str(start) if start == end else f"{start}-{end}"
+    if isinstance(numbers, list) and numbers:
+        return ", ".join(str(page) for page in numbers if isinstance(page, int))
+    return "not available"
+
+
+def _format_document_diagnostics(
+    question: str,
+    stats: DocumentStatsResponse,
+    retrieved_sources: list[dict[str, object]] | None,
+) -> str:
+    """Answer index diagnostics directly from persisted metadata, not the LLM."""
+    lines = [
+        f"Indexed chunks in this document: {stats.indexed_chunk_count}.",
+        f"Chunks retrieved for this question: {len(retrieved_sources or [])}.",
+    ]
+    show_chunk_details = (
+        re.search(
+            r"\b(?:id|ids|range|ranges|page|pages|metadata|list|show)\b",
+            question,
+            re.IGNORECASE,
+        )
+        is not None
+    )
+    if show_chunk_details and stats.chunks:
+        lines.append("Indexed chunk metadata:")
+        for chunk in stats.chunks:
+            page_label = _page_label(chunk.page_numbers, chunk.page_start, chunk.page_end)
+            lines.append(
+                f"- index {chunk.chunk_index}: {chunk.chunk_id}; pages {page_label}; "
+                f"characters {chunk.start_char}-{chunk.end_char}"
+            )
+    if show_chunk_details and retrieved_sources:
+        lines.append("Retrieved chunks:")
+        for source in retrieved_sources:
+            metadata = source.get("chunk_metadata")
+            chunk_metadata = metadata if isinstance(metadata, dict) else {}
+            page_label = _page_label(
+                chunk_metadata.get("page_numbers"),
+                chunk_metadata.get("page_start"),
+                chunk_metadata.get("page_end"),
+            )
+            lines.append(
+                f"- {source.get('id')}: {source.get('chunk_id')} "
+                f"(index {source.get('chunk_index')}; pages {page_label})"
+            )
+    return "\n".join(lines)
+
+
+def _document_diagnostic_answer(request: AskRequest, prepared) -> str | None:
+    if not _document_diagnostics_question(request.question):
+        return None
+    if request.document_ids is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="Document diagnostics require one selected document at a time.",
+        )
+    if request.document_id is None:
+        return None
+    stats = _load_document_stats(request.document_id)
+    return _format_document_diagnostics(request.question, stats, prepared.retrieved_sources)
+
+
 def _prepare_page_answer_context(request: AskRequest, context_limit: int):
     """Index the active page, then retrieve only from that successfully indexed page."""
     if request.page is None:
@@ -332,6 +467,7 @@ def _prepare_answer_context(request: AskRequest, context_limit: int):
 
 _CITATION_REFERENCE = re.compile(r"\[([A-Z][0-9]*)\]")
 _ABSTENTION_PHRASES = (
+    "not enough verified evidence",
     "not enough evidence",
     "insufficient evidence",
     "cannot determine from the provided",
@@ -355,6 +491,7 @@ def _validate_grounded_answer(
     if not retrieved_sources:
         return answer
     if any(phrase in answer.casefold() for phrase in _ABSTENTION_PHRASES):
+        logger.info("rag_answer_validation outcome=accepted_abstention reason=model_abstained")
         return answer
     valid_ids = {
         str(source.get("id")) for source in retrieved_sources if isinstance(source.get("id"), str)
@@ -362,12 +499,41 @@ def _validate_grounded_answer(
     if page_context.get("text", "").strip():
         valid_ids.add("P")
     references = _CITATION_REFERENCE.findall(answer)
-    if not references or any(reference not in valid_ids for reference in references):
+    if not references:
         logger.info(
-            "rag_answer_rejected code=invalid_or_missing_citations sources=%d", len(valid_ids)
+            "rag_answer_validation outcome=rejected reason=missing_citations source_count=%d",
+            len(valid_ids),
         )
         return _SAFE_GROUNDED_ABSTENTION
+    invalid_reference_count = sum(reference not in valid_ids for reference in references)
+    if invalid_reference_count:
+        logger.info(
+            "rag_answer_validation outcome=rejected reason=unknown_citations "
+            "source_count=%d invalid_reference_count=%d",
+            len(valid_ids),
+            invalid_reference_count,
+        )
+        return _SAFE_GROUNDED_ABSTENTION
+    logger.info(
+        "rag_answer_validation outcome=accepted reason=valid_citations source_count=%d "
+        "citation_count=%d",
+        len(valid_ids),
+        len(references),
+    )
     return answer
+
+
+def _evidence_context_chars(
+    page_context: dict[str, str], sources: list[dict[str, object]] | None
+) -> int:
+    """Count evidence text handed to generation without recording its contents."""
+    page_chars = sum(len(value) for value in page_context.values())
+    source_chars = sum(
+        len(source.get("text", ""))
+        for source in sources or []
+        if isinstance(source.get("text", ""), str)
+    )
+    return page_chars + source_chars
 
 
 def _citation_sources(sources: list[dict[str, object]] | None) -> list[AnswerSource] | None:
@@ -409,14 +575,40 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def _load_document_stats(document_id: str) -> DocumentStatsResponse:
+    try:
+        with get_ingestion_session_factory()() as session:
+            document = DocumentRepository(session).get_by_id(document_id)
+    except (DatabaseConfigurationError, SQLAlchemyError):
+        raise HTTPException(
+            status_code=503, detail="Document statistics are temporarily unavailable."
+        ) from None
+    if document is None or document.document.source_type not in {"text", "pdf"}:
+        raise HTTPException(status_code=404, detail="The selected document was not found.")
+    return _document_stats(document)
+
+
+@app.get("/documents/{document_id}/stats", response_model=DocumentStatsResponse)
+def get_document_stats(document_id: UUID) -> DocumentStatsResponse:
+    """Return persisted chunk/page metadata for one uploaded document only."""
+    return _load_document_stats(str(document_id))
+
+
 @app.post("/documents/upload")
 async def upload_document(file: Annotated[UploadFile, File()]) -> dict[str, object]:
     """Index a bounded TXT or text-based PDF without changing chat contracts."""
     try:
-        content = await file.read(MAX_UPLOAD_BYTES + 1)
-        if len(content) > MAX_UPLOAD_BYTES:
-            raise UploadValidationError("file_too_large", "Files must be 25 MiB or smaller.", 413)
-        saved = await run_in_threadpool(ingest_uploaded_file, file.filename, content)
+        max_upload_bytes = get_max_upload_bytes()
+        file.file.seek(0, 2)
+        upload_size = file.file.tell()
+        file.file.seek(0)
+        if upload_size > max_upload_bytes:
+            raise UploadValidationError(
+                "file_too_large",
+                f"Files must be {get_max_upload_mb()} MiB or smaller.",
+                413,
+            )
+        saved = await run_in_threadpool(ingest_uploaded_file, file.filename, file.file)
     except UploadValidationError as error:
         raise HTTPException(status_code=error.status_code, detail=error.detail) from None
     except UploadProcessingError as error:
@@ -449,25 +641,31 @@ def ask(request: AskRequest) -> AskResponse:
     try:
         context_limit = get_context_max_chars()
         prepared = _prepare_answer_context(request, context_limit)
+        diagnostic_answer = _document_diagnostic_answer(request, prepared)
         page_text_chars = len(request.page.text) if request.page else 0
         logger.info(
             "ask_context page_text_chars=%d selected_chars=%d context_limit_chars=%d "
-            "retrieval_used=%s",
+            "retrieval_used=%s retrieved_chunks=%d evidence_context_chars=%d",
             page_text_chars,
             len(prepared.page_context["text"]),
             context_limit,
             prepared.retrieval_used,
+            len(prepared.retrieved_sources or []),
+            _evidence_context_chars(prepared.page_context, prepared.retrieved_sources),
         )
-        history_max_messages, history_max_chars = get_history_limits()
-        answer = get_answer_service().answer(
-            request.question,
-            prepared.page_context,
-            _bounded_history(request.history, history_max_messages, history_max_chars),
-            prepared.retrieved_sources,
-        )
-        answer = _validate_grounded_answer(
-            answer, prepared.retrieved_sources, prepared.page_context
-        )
+        if diagnostic_answer is not None:
+            answer = diagnostic_answer
+        else:
+            history_max_messages, history_max_chars = get_history_limits()
+            answer = get_answer_service().answer(
+                request.question,
+                prepared.page_context,
+                _bounded_history(request.history, history_max_messages, history_max_chars),
+                prepared.retrieved_sources,
+            )
+            answer = _validate_grounded_answer(
+                answer, prepared.retrieved_sources, prepared.page_context
+            )
     except LLMConfigurationError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     except APITimeoutError as error:
@@ -486,7 +684,9 @@ def ask(request: AskRequest) -> AskResponse:
             detail="The language model request failed. Please try again.",
         ) from error
 
-    citations = _citation_sources(prepared.retrieved_sources)
+    citations = (
+        None if diagnostic_answer is not None else _citation_sources(prepared.retrieved_sources)
+    )
     return AskResponse(answer=answer, sources=citations)
 
 
@@ -562,7 +762,12 @@ async def _answer_events(
     history: list[dict[str, str]],
     retrieved_sources: list[dict[str, object]] | None,
     citation_sources: list[AnswerSource] | None,
+    diagnostic_answer: str | None = None,
 ) -> AsyncIterator[str]:
+    if diagnostic_answer is not None:
+        yield _event("token", {"text": diagnostic_answer})
+        yield _event("done", {"done": True})
+        return
     answer_stream = stream_answer(
         request.question,
         page_context,
@@ -610,14 +815,17 @@ async def ask_stream(request: AskRequest) -> StreamingResponse:
         raise HTTPException(status_code=503, detail=str(error)) from error
 
     prepared = await run_in_threadpool(_prepare_answer_context, request, settings.context_max_chars)
+    diagnostic_answer = await run_in_threadpool(_document_diagnostic_answer, request, prepared)
     page_text_chars = len(request.page.text) if request.page else 0
     logger.info(
         "ask_stream_context page_text_chars=%d selected_chars=%d context_limit_chars=%d "
-        "retrieval_used=%s",
+        "retrieval_used=%s retrieved_chunks=%d evidence_context_chars=%d",
         page_text_chars,
         len(prepared.page_context["text"]),
         settings.context_max_chars,
         prepared.retrieval_used,
+        len(prepared.retrieved_sources or []),
+        _evidence_context_chars(prepared.page_context, prepared.retrieved_sources),
     )
     history = _bounded_history(
         request.history,
@@ -632,7 +840,10 @@ async def ask_stream(request: AskRequest) -> StreamingResponse:
             len(request.page.text) if request.page else 0,
             history,
             prepared.retrieved_sources,
-            _citation_sources(prepared.retrieved_sources),
+            None
+            if diagnostic_answer is not None
+            else _citation_sources(prepared.retrieved_sources),
+            diagnostic_answer,
         ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
