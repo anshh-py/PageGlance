@@ -4,8 +4,6 @@
 
 PageGlance is a personal portfolio project that combines a Chrome Extension (Manifest V3) with a FastAPI backend to perform scoped RAG over the active webpage or uploaded PDFs/TXT files. It uses local embeddings, PostgreSQL + pgvector, hybrid retrieval (vector + PostgreSQL FTS) with Reciprocal Rank Fusion, optional cross-encoder reranking, Groq for generation, and source-grounding with citations.
 
-> This is a personal portfolio project, not a production SaaS application.
-
 ## Problem it solves
 
 Users want to ask questions about content they're looking at without manually searching or copying context. PageGlance indexes the active webpage or uploaded documents into a scoped knowledge base and returns answers grounded in retrieved evidence with citations.
@@ -152,11 +150,11 @@ Copy `.env.example` to `.env` and configure. See `.env.example` for all variable
 ```
 pageglance/
 +-- backend/
-¦   +-- app/           # FastAPI app, RAG, retrieval, LLM, embeddings, ingestion
-¦   +-- alembic/       # migrations
-¦   +-- evals/         # evaluation datasets and runners
-¦   +-- tests/         # pytest tests
-¦   +-- pyproject.toml
+Â¦   +-- app/           # FastAPI app, RAG, retrieval, LLM, embeddings, ingestion
+Â¦   +-- alembic/       # migrations
+Â¦   +-- evals/         # evaluation datasets and runners
+Â¦   +-- tests/         # pytest tests
+Â¦   +-- pyproject.toml
 +-- extension/         # Chrome extension (React/TS/Vite)
 +-- Start_PageGlance.bat
 +-- .env.example
@@ -177,6 +175,3 @@ pageglance/
 - Improve error handling and observability
 - Additional retrieval strategies
 - Better document type support
-
-## Notes
-Screenshots/demo media not included. Commands/paths/endpoints reflect the actual codebase as implemented.
