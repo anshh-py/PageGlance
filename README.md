@@ -552,15 +552,6 @@ The Firefox extension has been submitted to Mozilla Add-ons for review. Its publ
 For versioned builds and release notes, visit the [GitHub Releases](https://github.com/anshh-py/PageGlance/releases) page.
 
 ---
-
-## Author
-
-**Ansh**
-
-BCA Student | AI/ML & Software Development
-
-Interested in building practical applications involving artificial intelligence, retrieval systems, backend engineering, and intelligent automation.
-
 **Connect:**
 
 - GitHub: [@anshh-py](https://github.com/anshh-py)
