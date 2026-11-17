@@ -44,7 +44,9 @@ The project brings together browser-extension engineering, backend API developme
 | GitHub Repository | [anshh-py/PageGlance](https://github.com/anshh-py/PageGlance) |
 | GitHub Releases | [Download Releases](https://github.com/anshh-py/PageGlance/releases) |
 
-> **Firefox availability:** The add-on submission has been sent to Mozilla and is awaiting review. Public installation availability depends on Mozilla's publication process.
+> **Firefox availability:** PageGlance Firefox v0.1.1 has been approved and published on Mozilla Add-ons and is available for public installation.
+
+> **Chrome availability:** Chrome v0.1.1 has a built and locally verified ZIP package intended for GitHub Releases distribution. It is not published on the Chrome Web Store.
 
 ---
 
@@ -328,6 +330,8 @@ PageGlance/
 │   │
 │   ├── public/
 │   ├── scripts/
+│   │   ├── pack-chrome.mjs
+│   │   ├── verify-chrome-zip.mjs
 │   │   ├── pack-firefox.mjs
 │   │   └── verify-firefox-zip.mjs
 │   │
@@ -465,11 +469,7 @@ Keep private environment files out of version control.
 
 Use the browser-specific build scripts defined in `extension/package.json`.
 
-```bash
-npm run build
-```
-
-For Firefox, use the dedicated Firefox build and packaging scripts:
+For Firefox:
 
 ```bash
 npm run build:firefox
@@ -477,7 +477,15 @@ npm run pack:firefox
 npm run verify:firefox
 ```
 
-> Run the exact scripts available in the current package configuration. Browser-specific build commands may differ by target.
+For Chrome:
+
+```bash
+npm run build:chrome
+npm run pack:chrome
+npm run verify:chrome
+```
+
+For a generic development build, use the configured `npm run build` script.
 
 ### 8. Load the Extension Locally
 
@@ -542,16 +550,45 @@ PageGlance demonstrates practical implementation of several software engineering
 
 PageGlance provides browser-specific production builds.
 
-| Browser | Distribution |
-|---|---|
-| Chrome | [GitHub Releases](https://github.com/anshh-py/PageGlance/releases) |
-| Firefox | [Mozilla Add-ons Listing](https://addons.mozilla.org/en-GB/firefox/addon/pageglance/) |
+| Browser | Version | Distribution | Status |
+|---|---|---|---|
+| Firefox | 0.1.1 | [Mozilla Add-ons Listing](https://addons.mozilla.org/en-GB/firefox/addon/pageglance/) | Approved, published and publicly available |
+| Chrome | 0.1.1 | [GitHub Releases](https://github.com/anshh-py/PageGlance/releases) | ZIP built and verified; Chrome Web Store publication not available |
 
-The Firefox extension has been submitted to Mozilla Add-ons for review. Its public availability is subject to Mozilla's review and publication process.
+### Production Build Commands
+
+**Chrome**
+
+```bash
+npm run build:chrome
+npm run pack:chrome
+npm run verify:chrome
+```
+
+**Firefox**
+
+```bash
+npm run build:firefox
+npm run pack:firefox
+npm run verify:firefox
+```
+
+### Release Verification
+
+The following focused checks were completed for the v0.1.1 release work:
+
+| Verification | Result |
+|---|---|
+| Chrome ZIP verification | 24/24 checks passed |
+| Firefox ZIP verification | 24/24 checks passed |
+| Focused browser tests | 5/5 tests passed |
+
+The Chrome ZIP package was generated and verified locally. Chrome Web Store publication requires a separate developer registration and has not been completed.
 
 For versioned builds and release notes, visit the [GitHub Releases](https://github.com/anshh-py/PageGlance/releases) page.
 
 ---
+
 **Connect:**
 
 - GitHub: [@anshh-py](https://github.com/anshh-py)
@@ -569,9 +606,9 @@ For versioned builds and release notes, visit the [GitHub Releases](https://gith
 
 # PageGlance
 
-**Chrome extension + FastAPI backend for asking questions about webpages and uploaded documents with retrieval-grounded answers and citations.**
+**Chrome and Firefox extension + FastAPI backend for asking questions about webpages and uploaded documents with retrieval-grounded answers and citations.**
 
-PageGlance is a personal portfolio project that combines a Chrome Extension (Manifest V3) with a FastAPI backend to perform scoped RAG over the active webpage or uploaded PDFs/TXT files. It uses local embeddings, PostgreSQL + pgvector, hybrid retrieval (vector + PostgreSQL FTS) with Reciprocal Rank Fusion, optional cross-encoder reranking, Groq for generation, and source-grounding with citations.
+PageGlance is a personal portfolio project that combines browser extensions (Manifest V3) with a FastAPI backend to perform scoped RAG over the active webpage or uploaded PDFs/TXT files. It uses local embeddings, PostgreSQL + pgvector, hybrid retrieval (vector + PostgreSQL FTS) with Reciprocal Rank Fusion, optional cross-encoder reranking, Groq for generation, and source-grounding with citations.
 
 ## Problem it solves
 
@@ -595,43 +632,43 @@ Users want to ask questions about content they're looking at without manually se
 
 ```mermaid
 flowchart TD
-  A[Chrome Extension<br/>React + TypeScript + Vite<br/>Manifest V3] -->|HTTP POST /ask or /ask/stream| B[FastAPI Backend<br/>app.main]
-  B --> C[Scope resolution<br/>page / document / documents]
-  C --> D[Page indexing / Document retrieval<br/>app.page_indexing, app.rag]
-  D --> E[Chunking & normalization<br/>app.chunking, app.ingestion]
-  E --> F[Embeddings<br/>SentenceTransformers / app.embeddings]
-  F --> G[(PostgreSQL + pgvector)]
-  G --> H[Hybrid retrieval<br/>Vector + FTS]
-  H --> I[RRF fusion]
-  I --> J{Reranker enabled?}
-  J -->|yes| K[Cross-encoder rerank]
-  J -->|no| L[Top-k selection]
-  K --> L
-  L --> M[Context assembly<br/>app.rag]
-  M --> N[Groq LLM generation<br/>app.llm]
-  N --> O[Citation validation<br/>app.main]
-  O --> A
+    A[Chrome Extension<br/>React + TypeScript + Vite<br/>Manifest V3] -->|HTTP POST /ask or /ask/stream| B[FastAPI Backend<br/>app.main]
+    B --> C[Scope resolution<br/>page / document / documents]
+    C --> D[Page indexing / Document retrieval<br/>app.page_indexing, app.rag]
+    D --> E[Chunking & normalization<br/>app.chunking, app.ingestion]
+    E --> F[Embeddings<br/>SentenceTransformers / app.embeddings]
+    F --> G[(PostgreSQL + pgvector)]
+    G --> H[Hybrid retrieval<br/>Vector + FTS]
+    H --> I[RRF fusion]
+    I --> J{Reranker enabled?}
+    J -->|yes| K[Cross-encoder rerank]
+    J -->|no| L[Top-k selection]
+    K --> L
+    L --> M[Context assembly<br/>app.rag]
+    M --> N[Groq LLM generation<br/>app.llm]
+    N --> O[Citation validation<br/>app.main]
+    O --> A
 ```
 
 ## Technology stack (actual)
 
-| Layer               | Technologies                                                                                                                     |
-| ------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| Extension           | React, TypeScript, Vite, Chrome Manifest V3                                                                                      |
-| Backend API         | FastAPI, Pydantic, Uvicorn                                                                                                       |
-| LLM                 | Groq API (via `groq` SDK), default model `openai/gpt-oss-20b`                                                                    |
-| Auth                | Installation bearer tokens, token hashes, per-owner scoping                                                                      |
-| Rate limiting       | Shared-DB fixed-window counters, fail-closed                                                                                     |
-| Deployment          | Hugging Face Spaces (Gradio SDK bundle), FastAPI mounted via `gr.mount_gradio_app()`                                             |
-| Embeddings          | `sentence-transformers` (`all-MiniLM-L6-v2`, 384-dim)                                                                            |
-| Retrieval           | pgvector cosine similarity, PostgreSQL full-text search (simple regconfig), RRF, optional `cross-encoder/ms-marco-MiniLM-L-6-v2` |
-| Storage             | PostgreSQL, SQLAlchemy 2.x, pgvector, Alembic                                                                                    |
-| Document processing | PyPDF/pypdf, PyMuPDF, pytesseract, Pillow                                                                                        |
-| Tracing/Eval        | LangSmith SDK, Ragas, datasets, pytest                                                                                           |
+| Layer | Technologies |
+|---|---|
+| Extension | React, TypeScript, Vite, Chrome and Firefox Manifest V3 |
+| Backend API | FastAPI, Pydantic, Uvicorn |
+| LLM | Groq API (via `groq` SDK), default model `openai/gpt-oss-20b` |
+| Auth | Installation bearer tokens, token hashes, per-owner scoping |
+| Rate limiting | Shared-DB fixed-window counters, fail-closed |
+| Deployment | Hugging Face Spaces (Gradio SDK bundle), FastAPI mounted via `gr.mount_gradio_app()` |
+| Embeddings | `sentence-transformers` (`all-MiniLM-L6-v2`, 384-dim) |
+| Retrieval | pgvector cosine similarity, PostgreSQL full-text search (simple regconfig), RRF, optional `cross-encoder/ms-marco-MiniLM-L-6-v2` |
+| Storage | PostgreSQL, SQLAlchemy 2.x, pgvector, Alembic |
+| Document processing | PyPDF/pypdf, PyMuPDF, pytesseract, Pillow |
+| Tracing/Eval | LangSmith SDK, Ragas, datasets, pytest |
 
 ## How the extension and backend communicate
 
-- The Chrome extension sends JSON to the FastAPI backend over HTTP (same-origin/CORS configured in `app.main`; Chrome/Firefox extension origins are allowed).
+- The browser extension sends JSON to the FastAPI backend over HTTP (same-origin/CORS configured in `app.main`; Chrome/Firefox extension origins are allowed).
 - Endpoints: `POST /ask` (JSON response with `answer` and optional `sources`), `POST /ask/stream` (SSE). Additional endpoints for document upload/stats/health/deletion.
 - Requests include `question`, scope (`page`, `document_id`, or `document_ids`), and optional `history`. The backend scopes retrieval to the provided scope and returns citations referencing retrieved chunks/sources.
 - Every ingestion/retrieval/stats route is authenticated with the installation's bearer token (`Authorization: Bearer <token>`), registered once via `POST /auth/register`.
@@ -647,16 +684,16 @@ flowchart TD
 
 ## API endpoints (actual)
 
-| Method   | Path                             | Description                                                           |
-| -------- | -------------------------------- | --------------------------------------------------------------------- |
-| `GET`    | `/health`                        | Health check                                                          |
-| `GET`    | `/documents/{document_id}/stats` | Indexed chunk stats for a document (no full text)                     |
-| `POST`   | `/documents/upload`              | Upload TXT/PDF for ingestion/indexing                                 |
-| `POST`   | `/ask`                           | Synchronous answer with citations                                     |
-| `POST`   | `/ask/stream`                    | SSE streaming answer (`sources`, `token`, `replace`, `done`, `error`) |
-| `POST`   | `/auth/register`                 | Register an installation token (only its hash is stored), idempotent  |
-| `POST`   | `/ingest/url`                    | Fetch and index a server-side URL (SSRF-guarded)                      |
-| `DELETE` | `/documents/{document_id}`       | Delete an owned document and its chunks/embeddings                    |
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health` | Health check |
+| `GET` | `/documents/{document_id}/stats` | Indexed chunk stats for a document (no full text) |
+| `POST` | `/documents/upload` | Upload TXT/PDF for ingestion/indexing |
+| `POST` | `/ask` | Synchronous answer with citations |
+| `POST` | `/ask/stream` | SSE streaming answer (`sources`, `token`, `replace`, `done`, `error`) |
+| `POST` | `/auth/register` | Register an installation token (only its hash is stored), idempotent |
+| `POST` | `/ingest/url` | Fetch and index a server-side URL (SSRF-guarded) |
+| `DELETE` | `/documents/{document_id}` | Delete an owned document and its chunks/embeddings |
 
 See `backend/app/main.py` for request/response schemas and validation.
 
@@ -689,17 +726,17 @@ The backend deploys to a **Gradio SDK** Space (free CPU tier, no Docker), mounti
 
 Deploy by uploading the bundle contents to the Space repo and setting **Secrets** for the required variables (names only, never commit values):
 
-| Variable                                                                 | Required    | Purpose                                              |
-| ------------------------------------------------------------------------ | ----------- | ---------------------------------------------------- |
-| `DATABASE_URL`                                                           | yes         | Production PostgreSQL connection (provider-agnostic) |
-| `DATABASE_SSLMODE`                                                       | conditional | `require` for SSL-only providers                     |
-| `DATABASE_POOL_SIZE` / `DATABASE_MAX_OVERFLOW` / `DATABASE_POOL_RECYCLE` | no          | Pool tuning                                          |
-| `GROQ_API_KEY`                                                           | yes         | LLM provider key                                     |
-| `GROQ_MODEL`                                                             | no          | Default `openai/gpt-oss-20b`                         |
-| `PAGEGLANCE_EMBEDDING_PROVIDER`                                          | no          | `sentence_transformers` (default, local CPU)         |
-| `PAGEGLANCE_LOCAL_EMBEDDING_MODEL`                                       | no          | Default `sentence-transformers/all-MiniLM-L6-v2`     |
-| `PAGEGLANCE_TESSERACT_CMD`                                               | no          | Linux default `/usr/bin/tesseract`                   |
-| `PORT`                                                                   | no          | Spaces sets this (default `7860`)                    |
+| Variable | Required | Purpose |
+|---|---|---|
+| `DATABASE_URL` | yes | Production PostgreSQL connection (provider-agnostic) |
+| `DATABASE_SSLMODE` | conditional | `require` for SSL-only providers |
+| `DATABASE_POOL_SIZE` / `DATABASE_MAX_OVERFLOW` / `DATABASE_POOL_RECYCLE` | no | Pool tuning |
+| `GROQ_API_KEY` | yes | LLM provider key |
+| `GROQ_MODEL` | no | Default `openai/gpt-oss-20b` |
+| `PAGEGLANCE_EMBEDDING_PROVIDER` | no | `sentence_transformers` (default, local CPU) |
+| `PAGEGLANCE_LOCAL_EMBEDDING_MODEL` | no | Default `sentence-transformers/all-MiniLM-L6-v2` |
+| `PAGEGLANCE_TESSERACT_CMD` | no | Linux default `/usr/bin/tesseract` |
+| `PORT` | no | Spaces sets this (default `7860`) |
 
 Full step-by-step staging and secret guidance is in `pageglance_backend/README.md` and `deployment/huggingface/README.md`.
 
@@ -770,13 +807,15 @@ npm run dev  # or build
 # Load unpacked extension in Chrome from extension/dist or source as configured
 ```
 
+For production packaging, use the browser-specific build and packaging commands documented in the Release & Distribution section above.
+
 ### Environment variables
 
 Copy `.env.example` to `.env` and configure. See `.env.example` for all variables (keys redacted in examples). Never commit real API keys.
 
 ## Repository structure (actual, excluding venv/caches/secrets)
 
-```
+```text
 pageglance/
 +-- backend/
 ¦   +-- app/           # FastAPI app, RAG, retrieval, LLM, embeddings, ingestion
@@ -784,7 +823,7 @@ pageglance/
 ¦   +-- evals/         # evaluation datasets and runners
 ¦   +-- tests/         # pytest tests
 ¦   +-- pyproject.toml
-+-- extension/         # Chrome extension (React/TS/Vite)
++-- extension/         # Chrome and Firefox extensions (React/TS/Vite)
 +-- deployment/        # Hugging Face Space deployment adapter + bundle
 +-- pageglance_backend/ # Ready-to-upload Gradio SDK Space bundle
 +-- Start_PageGlance.bat
@@ -808,3 +847,6 @@ pageglance/
 - Additional retrieval strategies
 - Better document type support
 
+---
+
+**Last updated: November 17, 2026**
