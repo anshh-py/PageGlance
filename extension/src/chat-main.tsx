@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.tsx'
 import type { ThemePreference } from './main'
+import { browser } from './browser'
 
 const THEME_STORAGE_KEY = 'pageGlanceTheme'
 
@@ -13,7 +14,7 @@ function isThemePreference(value: unknown): value is ThemePreference {
 async function mountFullPage() {
   let theme: ThemePreference = 'system'
   try {
-    const stored = await chrome.storage.local.get(THEME_STORAGE_KEY)
+    const stored = await browser.storage.local.get(THEME_STORAGE_KEY)
     if (isThemePreference(stored[THEME_STORAGE_KEY])) theme = stored[THEME_STORAGE_KEY]
   } catch {
     // Keep the system preference when extension storage is unavailable.

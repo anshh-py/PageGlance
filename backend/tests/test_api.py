@@ -24,7 +24,7 @@ class FakeAnswerService:
         retrieved_sources=None,
     ) -> str:
         assert question == "What is this page about?"
-        assert page_context == {**VALID_PAGE, "url": "https://example.com/"}
+        assert page_context == {**VALID_PAGE, "url": "https://example.com/", "blocks": []}
         assert history == []
         assert retrieved_sources is None
         return "The page is an example."
@@ -32,7 +32,11 @@ class FakeAnswerService:
 
 def no_live_retrieval(monkeypatch) -> None:
     """Keep existing endpoint tests independent of hosted embedding credentials."""
-    monkeypatch.setattr(main, "rag_orchestrator", RagOrchestrator(lambda *_args, **_kwargs: []))
+    monkeypatch.setattr(
+        main,
+        "rag_orchestrator",
+        RagOrchestrator(lambda *_args, **_kwargs: []),
+    )
     monkeypatch.setattr(
         main,
         "index_page_context",
@@ -43,6 +47,30 @@ def no_live_retrieval(monkeypatch) -> None:
 @pytest.fixture(autouse=True)
 def prevent_live_embedding_requests(monkeypatch) -> None:
     no_live_retrieval(monkeypatch)
+    # Keep HTTP route tests off the production rate-limit store: the router
+    # calls main.rate_limiter.check_installation/check_ip, which otherwise
+    # reach the real PostgreSQL/Neon store and fail closed with 503 before the
+    # intended assertion is observed. Use an isolated SQLite store and disable
+    # counting so routes reach their mock/provider assertions. Rate limiting
+    # itself is covered in test_rate_limit.py.
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    from app import ratelimit
+    from app.models import Base
+
+    engine = create_engine(
+        "sqlite+pysqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr(
+        main, "rate_limiter", ratelimit.RateLimiter(session_factory=lambda: factory)
+    )
+    monkeypatch.setattr(ratelimit, "get_action_limit", lambda action: 0)
 
 
 def test_ask_returns_predictable_answer_schema(monkeypatch) -> None:
@@ -76,7 +104,14 @@ def test_ask_indexes_reuses_embeddings_and_keeps_url_scopes_separate(monkeypatch
         )
         return PageIndexResult(True, document_id, 1)
 
-    def retrieve(_question, *, document_id, document_ids, source_url):
+    def retrieve(
+        _question,
+        *,
+        document_id,
+        document_ids,
+        source_url,
+        source_type=None,
+    ):
         assert source_url is None
         assert document_ids is None
         retrieval_scopes.append(document_id)
@@ -122,7 +157,14 @@ def test_retrieval_scope_uses_indexed_active_page_not_request_document_id(monkey
         seen_page_ids.append(page.get("document_id"))
         return PageIndexResult(True, "indexed-active-page", 1)
 
-    def retrieve(_question, *, document_id, document_ids, source_url):
+    def retrieve(
+        _question,
+        *,
+        document_id,
+        document_ids,
+        source_url,
+        source_type=None,
+    ):
         scopes.append((document_id, document_ids, source_url))
         return []
 
@@ -235,7 +277,7 @@ def test_ask_passes_scoped_retrieved_sources_and_history_to_answer_service(monke
         main,
         "rag_orchestrator",
         RagOrchestrator(
-            lambda question, *, document_id, document_ids, source_url: (
+            lambda question, *, document_id, document_ids, source_url, source_type=None: (
                 scopes.append((question, document_id, document_ids, source_url)) or [chunk]
             )
         ),
@@ -404,8 +446,16 @@ def test_ask_rejects_missing_oversized_and_blank_input() -> None:
 
 def test_ask_reports_missing_provider_configuration(monkeypatch) -> None:
     no_live_retrieval(monkeypatch)
-    monkeypatch.setattr(llm.os, "environ", {})
-    llm.get_answer_service.cache_clear()
+
+    # The route maps a missing/blank provider key to 503. Simulate that
+    # condition at the call site rather than clearing os.environ, because the
+    # rate-limit/upload middleware reloads the repository .env file with
+    # load_dotenv(override=False) during the request, which would restore the
+    # real key and defeat the simulation.
+    def missing_provider_configuration():
+        raise llm.LLMConfigurationError("GROQ_API_KEY is not configured.")
+
+    monkeypatch.setattr(main, "get_answer_service", missing_provider_configuration)
     response = client.post("/ask", json={"question": "Summarize this", "page": VALID_PAGE})
 
     assert response.status_code == 503
@@ -537,7 +587,7 @@ def test_stream_uses_retrieved_sources_and_preserves_sse_contract(monkeypatch) -
         main,
         "rag_orchestrator",
         RagOrchestrator(
-            lambda question, *, document_id, document_ids, source_url: (
+            lambda question, *, document_id, document_ids, source_url, source_type=None: (
                 scopes.append((question, document_id, document_ids, source_url)) or [source_chunk]
             )
         ),

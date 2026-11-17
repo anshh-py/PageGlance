@@ -31,12 +31,13 @@ def _chunk() -> RetrievedChunk:
 def test_rag_prepares_source_citations_and_restricts_to_active_scope() -> None:
     captured = {}
 
-    def retrieve(question, *, document_id, document_ids, source_url):
+    def retrieve(question, *, document_id, document_ids, source_url, source_type=None):
         captured.update(
             question=question,
             document_id=document_id,
             document_ids=document_ids,
             source_url=source_url,
+            source_type=source_type,
         )
         return [_chunk()]
 
@@ -49,6 +50,7 @@ def test_rag_prepares_source_citations_and_restricts_to_active_scope() -> None:
         "document_id": "doc-1",
         "document_ids": None,
         "source_url": None,
+        "source_type": None,
     }
     assert prepared.retrieval_used is True
     assert prepared.page_context == PAGE
@@ -72,7 +74,7 @@ def test_rag_prepares_source_citations_and_restricts_to_active_scope() -> None:
 def test_page_url_scopes_retrieval_and_empty_index_uses_page_fallback() -> None:
     scopes = []
 
-    def retrieve(_question, *, document_id, document_ids, source_url):
+    def retrieve(_question, *, document_id, document_ids, source_url, source_type=None):
         scopes.append((document_id, document_ids, source_url))
         return []
 
@@ -86,7 +88,7 @@ def test_page_url_scopes_retrieval_and_empty_index_uses_page_fallback() -> None:
 
 
 def test_retrieval_database_failure_uses_selected_context_without_leaking_details() -> None:
-    def fail(_question, *, document_id, document_ids, source_url):
+    def fail(_question, *, document_id, document_ids, source_url, source_type=None):
         raise RetrievalDatabaseError("retrieval_database_error", "private database connection URL")
 
     long_page = {**PAGE, "text": "Intro paragraph.\n\n" + ("More page information.\n\n" * 200)}
@@ -115,7 +117,7 @@ def test_disabled_retrieval_uses_fallback_without_calling_retriever() -> None:
 def test_simple_question_uses_one_normal_retrieval_call() -> None:
     calls = []
 
-    def retrieve(question, *, document_id, document_ids, source_url):
+    def retrieve(question, *, document_id, document_ids, source_url, source_type=None):
         calls.append((question, document_id, document_ids, source_url))
         return [_chunk()]
 
@@ -138,7 +140,7 @@ def test_multi_part_question_retries_only_missing_facets_in_same_scope() -> None
         }
     )
 
-    def retrieve(question, *, document_id, document_ids, source_url):
+    def retrieve(question, *, document_id, document_ids, source_url, source_type=None):
         calls.append((question, document_id, document_ids, source_url))
         if question.startswith("What is it made"):
             return [first]
@@ -163,7 +165,7 @@ def test_multi_part_question_retries_only_missing_facets_in_same_scope() -> None
 def test_adaptive_retry_round_is_bounded_to_three_queries() -> None:
     calls = []
 
-    def retrieve(question, *, document_id, document_ids, source_url):
+    def retrieve(question, *, document_id, document_ids, source_url, source_type=None):
         calls.append(question)
         return []
 
@@ -180,7 +182,7 @@ def test_adaptive_retry_round_is_bounded_to_three_queries() -> None:
 def test_explicit_empty_document_scope_never_falls_back_to_active_page() -> None:
     scopes = []
 
-    def retrieve(_question, *, document_id, document_ids, source_url):
+    def retrieve(_question, *, document_id, document_ids, source_url, source_type=None):
         scopes.append((document_id, document_ids, source_url))
         return []
 
@@ -195,7 +197,7 @@ def test_explicit_document_list_is_forwarded_without_page_scope() -> None:
     scopes = []
     selected_documents = ["document-a", "document-b"]
 
-    def retrieve(_question, *, document_id, document_ids, source_url):
+    def retrieve(_question, *, document_id, document_ids, source_url, source_type=None):
         scopes.append((document_id, document_ids, source_url))
         return []
 

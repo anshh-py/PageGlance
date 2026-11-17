@@ -1,0 +1,45 @@
+# Slim verification image: Python 3.11, real backend import-time deps + Gradio.
+# Torch/sentence-transformers are intentionally excluded — the embedding model is
+# lazily loaded (verified in app/embeddings.py) and is not needed to verify the
+# Gradio mounting, /health, route preservation, SSE, or CORS. This keeps the
+# PoC build fast and disposable.
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    TOKENIZERS_PARALLELISM=false
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+COPY backend/pyproject.toml /workspace/backend/pyproject.toml
+COPY deployment/huggingface/requirements.txt /workspace/deployment/huggingface/requirements.txt
+
+RUN pip install --no-cache-dir \
+        "fastapi>=0.115,<1.0" \
+        "groq>=1.7,<2.0" \
+        "openai>=1.50,<3.0" \
+        "pgvector>=0.3,<1.0" \
+        "Pillow>=10.0,<13.0" \
+        "psycopg[binary]>=3.2,<4.0" \
+        "pydantic>=2.9,<3.0" \
+        "pypdf>=5.0,<7.0" \
+        "PyMuPDF>=1.24,<2.0" \
+        "pytesseract>=0.3.13,<1.0" \
+        "python-dotenv>=1.0,<2.0" \
+        "python-multipart>=0.0.9,<1.0" \
+        "sqlalchemy>=2.0,<3.0" \
+        "uvicorn[standard]>=0.30,<1.0" \
+        -r /workspace/deployment/huggingface/requirements.txt
+
+COPY backend /workspace/backend
+COPY deployment /workspace/deployment
+
+# Add backend to path so `import app...` resolves.
+ENV PYTHONPATH=/workspace
+
+CMD ["python", "-m", "deployment.huggingface.verify_poc"]

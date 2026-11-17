@@ -1,0 +1,29 @@
+# Verification-only image: Python 3.11 (matches app Dockerfile), installs the
+# real backend dependencies + Gradio, and runs the PoC verification script.
+# This is NOT the production Space image; it is a disposable test harness.
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    TOKENIZERS_PARALLELISM=false
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# Backend app dependencies (the real ones).
+COPY backend/pyproject.toml /workspace/backend/pyproject.toml
+RUN pip install --no-cache-dir /workspace/backend
+
+# Gradio (deployment-only).
+COPY deployment/huggingface/requirements.txt /workspace/deployment/huggingface/requirements.txt
+RUN pip install --no-cache-dir -r /workspace/deployment/huggingface/requirements.txt
+
+# The full repo source needed to import and verify the real app.
+COPY backend /workspace/backend
+COPY deployment /workspace/deployment
+
+CMD ["python", "-m", "deployment.huggingface.verify_poc"]

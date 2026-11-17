@@ -1,0 +1,4 @@
+# Deployment-only requirements for the PageGlance Hugging Face Space adapter.
+# These are added to the application's own requirements at runtime; they are not
+# part of the backend package itself.
+gradio>=4.44.0,<6.0

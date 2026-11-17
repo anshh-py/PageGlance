@@ -25,6 +25,37 @@ def prevent_live_embedding_requests(monkeypatch) -> None:
     monkeypatch.setattr(main, "rag_orchestrator", RagOrchestrator(lambda *_args, **_kwargs: []))
 
 
+@pytest.fixture(autouse=True)
+def isolate_rate_limiter(monkeypatch) -> None:
+    """Keep HTTP route tests off the production rate-limit store.
+
+    The /ask route calls main.rate_limiter.check_installation/check_ip. Without
+    isolation those calls try to reach the real PostgreSQL/Neon store and fail
+    closed with 503 before the provider assertion is observed. Point the
+    limiter at an isolated SQLite store and disable counting so route tests
+    reach their intended mock/provider assertions. Rate limiting itself is
+    covered in test_rate_limit.py.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    from app import main, ratelimit
+    from app.models import Base
+
+    engine = create_engine(
+        "sqlite+pysqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr(
+        main, "rate_limiter", ratelimit.RateLimiter(session_factory=lambda: factory)
+    )
+    monkeypatch.setattr(ratelimit, "get_action_limit", lambda action: 0)
+
+
 def test_environment_file_is_root_anchored_independent_of_cwd(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
@@ -160,6 +191,74 @@ def test_fallback_prompt_does_not_claim_retrieval_or_include_empty_sources() -> 
     assert messages[0]["content"] == llm.SYSTEM_INSTRUCTIONS
     payload = json.loads(messages[-1]["content"].split("\n", 1)[1])
     assert "retrieved_sources" not in payload
+
+
+def test_bounded_concurrency_limit_is_enforced(monkeypatch) -> None:
+    """M9.4: the provider concurrency cap is a real bound, not advisory.
+
+    The request semaphores must be sized to the configured limit and must wrap
+    the actual provider call so competing calls cannot exceed it.
+    """
+    # Force a small, deterministic bound.
+    monkeypatch.setenv("PAGEGLANCE_LLM_MAX_CONCURRENCY", "2")
+    llm._llm_concurrency_configured = False
+    llm._configure_concurrency()
+    try:
+        assert llm._sync_semaphore._value == 2
+        assert llm._async_semaphore._value == 2
+    finally:
+        # Restore for later tests.
+        llm._llm_concurrency_configured = False
+        llm._configure_concurrency()
+
+    # Prove the bound is enforced on the async path: two concurrent stream
+    # calls may acquire the semaphore, a third must block until one releases.
+    import asyncio
+
+    class FakeStream:
+        def __aiter__(self):
+            async def gen():
+                yield type("C", (), {"choices": [type(
+                    "Ch", (), {"delta": type("D", (), {"content": "t"})()}
+                )()]})()
+
+            return gen()
+
+        async def close(self):
+            pass
+
+    active = {"n": 0, "max": 0}
+    release = asyncio.Event()
+
+    class FakeCompletions:
+        async def create(self, **_kwargs):
+            active["n"] += 1
+            active["max"] = max(active["max"], active["n"])
+            await release.wait()
+            active["n"] -= 1
+            return FakeStream()
+
+    class FakeClient:
+        chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(llm, "AsyncGroq", lambda **_kwargs: FakeClient())
+    settings = llm.LLMSettings("k", "m", 2, 64)
+
+    async def consume():
+        async for _ in llm.stream_answer("q", VALID_PAGE, settings):
+            pass
+
+    async def run():
+        tasks = [asyncio.create_task(consume()) for _ in range(4)]
+        await asyncio.sleep(0.05)  # let all four reach the semaphore
+        release.set()
+        await asyncio.gather(*tasks)
+
+    asyncio.run(run())
+    assert active["max"] <= 2
 
 
 def test_groq_sdk_provider_error_is_sanitized_by_api(monkeypatch) -> None:

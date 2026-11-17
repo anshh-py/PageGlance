@@ -4,6 +4,13 @@ export interface PageContext {
   title: string
   url: string
   text: string
+  /** Structured block references from the extractor (optional, backward-compatible). */
+  blocks?: Array<{
+    block_type: string
+    text: string
+    start_char: number
+    end_char: number
+  }>
 }
 
 export interface ExtractPageRequest {

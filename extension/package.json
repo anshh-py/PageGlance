@@ -6,8 +6,13 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "build:chrome": "tsc -b && vite build --config vite.config.chrome.ts && vite build --config vite.config.content.chrome.ts && node -e \"const fs=require('fs');fs.copyFileSync('manifests/chrome.json','dist/chrome/manifest.json')\"",
+    "build:firefox": "tsc -b && vite build --config vite.config.firefox.ts && vite build --config vite.config.content.firefox.ts && node -e \"const fs=require('fs');fs.copyFileSync('manifests/firefox.json','dist/firefox/manifest.json')\"",
+    "build:all": "npm run build:chrome && npm run build:firefox",
+    "pack:firefox": "node scripts/pack-firefox.mjs",
+    "release:firefox": "npm run build:firefox && npm run pack:firefox",
     "lint": "eslint .",
-    "test": "node --experimental-strip-types --test src/chat.test.mjs",
+    "test": "node --experimental-strip-types --test src/chat.test.mjs src/browser.test.mjs src/pageSupport.test.mjs src/extractionRecovery.test.mjs src/urlImport.test.mjs src/auth.test.mjs src/protectedRequests.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

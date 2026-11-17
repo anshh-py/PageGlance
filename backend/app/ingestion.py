@@ -18,14 +18,23 @@ def ingest_text(
     filename: str | None = None,
     metadata: dict[str, object] | None = None,
     chunking: ChunkingConfig | None = None,
+    owner_id: str | None = None,
 ) -> IngestionResult:
-    """Normalize supplied text and return a document plus ordered chunks."""
+    """Normalize supplied text and return a document plus ordered chunks.
+
+    The deterministic document identity incorporates the owner when one is
+    supplied so the same source content ingested by two different installations
+    maps to two distinct document records (never shared across owners).
+    """
     if source_type == "webpage" and source_url is not None:
         source_url = normalize_page_url(source_url)
     normalized = normalize_text(text)
     digest = content_hash(normalized)
     identity = source_url or filename or digest
-    stable_key = json.dumps(["pageglance-document-v1", source_type, identity], ensure_ascii=False)
+    stable_key = json.dumps(
+        ["pageglance-document-v1", source_type, identity, owner_id or ""],
+        ensure_ascii=False,
+    )
     document = Document(
         id=str(uuid5(NAMESPACE_URL, stable_key)),
         source_type=source_type,

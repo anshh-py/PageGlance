@@ -11,6 +11,7 @@ def embed_and_persist(
     *,
     repository: DocumentRepository,
     service: EmbeddingService,
+    owner_id: str | None = None,
 ) -> Document:
     """Embed only uncached chunk text, then atomically persist content and vectors."""
     model_version = service.model_version
@@ -43,4 +44,5 @@ def embed_and_persist(
         embedding_model=model_version,
         embedding_dimensions=dimensions,
         storage_profile=storage_profile,
+        owner_id=owner_id,
     )

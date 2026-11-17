@@ -65,7 +65,7 @@ def install_route_dependencies(monkeypatch):
 
     retrieved_documents: list[tuple[str, str]] = []
 
-    def retrieve(_question, *, document_id, document_ids, source_url):
+    def retrieve(_question, *, document_id, document_ids, source_url, source_type=None):
         events.append("retrieval")
         assert document_id is not None
         assert document_ids is None

@@ -6,14 +6,14 @@ from functools import lru_cache
 
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.contracts import BlockReference, ContentSource, ExtractedDocument
+from app.converters import ingest_extracted_document
 from app.db import DatabaseConfigurationError, create_session_factory
-from app.embedding_pipeline import embed_and_persist
 from app.embeddings import (
     EmbeddingError,
     EmbeddingService,
     get_default_embedding_service,
 )
-from app.ingestion import ingest_text
 from app.repository import DocumentRepository
 from app.url_identity import normalize_page_url
 
@@ -52,39 +52,80 @@ def get_ingestion_embedding_service() -> EmbeddingService:
     return _embedding_service()
 
 
-def index_page_context(page: dict[str, str]) -> PageIndexResult:
-    """Normalize, chunk, embed, and persist one active page with bounded work."""
-    text = page.get("text", "")
+def _structured_blocks(page: dict[str, object]) -> list[BlockReference]:
+    """Build validated block references from caller data, dropping invalid ones.
+
+    Offsets are validated against the normalized text (the same Pydantic
+    validator the contract enforces). Malformed or out-of-range references are
+    rejected rather than failing the whole page index.
+    """
+    raw = page.get("blocks") or page.get("structured_blocks") or []
+    if not isinstance(raw, list):
+        return []
+    text_length = len(str(page.get("text", "")))
+    blocks: list[BlockReference] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            block = BlockReference(**item)
+        except (ValueError, TypeError):
+            continue
+        if block.end_char > text_length or block.start_char > block.end_char:
+            continue
+        blocks.append(block)
+    return blocks
+
+
+def index_page_context(
+    page: dict[str, object], *, owner_id: str | None = None
+) -> PageIndexResult:
+    """Normalize, chunk, embed, and persist one active page with bounded work.
+
+    The owner may be passed explicitly or embedded as ``page["_owner_id"]`` so
+    callers that splice the owner into the page payload (e.g. HTTP routes) keep
+    test fixtures that stub this function signature-compatible.
+    """
+    if owner_id is None:
+        embedded = page.get("_owner_id")
+        owner_id = embedded if isinstance(embedded, str) and embedded else None
+    text = str(page.get("text", ""))
     if len(text) > MAX_PAGE_TEXT_CHARS:
         return PageIndexResult(False, None, 0, "page_text_too_large")
 
     try:
-        source_url = normalize_page_url(page.get("url", ""))
-        result = ingest_text(
-            text,
-            source_type="webpage",
-            title=page.get("title", ""),
-            source_url=source_url,
+        source_url = normalize_page_url(str(page.get("url", "")))
+        extracted = ExtractedDocument(
+            title=str(page.get("title", "")),
+            normalized_text=text,
+            source=ContentSource(source_type="webpage", original_url=source_url),
+            extraction_status="complete",
+            structured_blocks=_structured_blocks(page),
         )
-        if len(result.chunks) > MAX_PAGE_CHUNKS:
-            return PageIndexResult(False, None, 0, "page_chunk_limit_exceeded")
-        if not result.chunks:
-            return PageIndexResult(False, None, 0, "empty_page_text")
-
-        with get_ingestion_session_factory()() as session:
-            saved = embed_and_persist(
-                result,
-                repository=DocumentRepository(session),
-                service=get_ingestion_embedding_service(),
-            )
-        logger.info(
-            "page_indexed chunks=%d page_text_chars=%d",
-            len(result.chunks),
-            len(text),
+        converted = ingest_extracted_document(
+            extracted,
+            max_chunks=MAX_PAGE_CHUNKS,
+            repository_factory=DocumentRepository,
+            owner_id=owner_id,
         )
-        return PageIndexResult(True, saved.id, len(result.chunks))
     except (DatabaseConfigurationError, EmbeddingError, SQLAlchemyError, ValueError) as error:
         # Error details may contain provider or connection data; log only a safe code.
         code = getattr(error, "code", "page_index_failed")
         logger.warning("page_index_fallback code=%s page_text_chars=%d", code, len(text))
         return PageIndexResult(False, None, 0, code)
+
+    if not converted.indexed:
+        fallback = converted.fallback_code or "page_index_failed"
+        if fallback == "chunk_limit_exceeded":
+            fallback = "page_chunk_limit_exceeded"
+        logger.warning(
+            "page_index_fallback code=%s page_text_chars=%d", fallback, len(text)
+        )
+        return PageIndexResult(False, None, 0, fallback)
+
+    logger.info(
+        "page_indexed chunks=%d page_text_chars=%d",
+        converted.chunk_count,
+        len(text),
+    )
+    return PageIndexResult(True, converted.document_id, converted.chunk_count)

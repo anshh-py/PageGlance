@@ -4,10 +4,11 @@ import {
   parseConversationStore,
   type ConversationStore,
 } from './chat.ts'
+import { browser } from './browser.ts'
 
 export async function loadConversationStore(): Promise<ConversationStore> {
   try {
-    const stored = await chrome.storage.local.get(CHAT_STORAGE_KEY)
+    const stored = await browser.storage.local.get(CHAT_STORAGE_KEY)
     return parseConversationStore(stored[CHAT_STORAGE_KEY])
   } catch {
     return { version: CHAT_STORE_VERSION, conversations: {} }
@@ -15,9 +16,9 @@ export async function loadConversationStore(): Promise<ConversationStore> {
 }
 
 export async function saveConversationStore(store: ConversationStore): Promise<void> {
-  await chrome.storage.local.set({ [CHAT_STORAGE_KEY]: store })
+  await browser.storage.local.set({ [CHAT_STORAGE_KEY]: store })
 }
 
 export async function clearConversationStore(): Promise<void> {
-  await chrome.storage.local.remove(CHAT_STORAGE_KEY)
+  await browser.storage.local.remove(CHAT_STORAGE_KEY)
 }

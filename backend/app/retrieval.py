@@ -139,6 +139,7 @@ def build_similarity_query(
     document_ids: list[str] | None = None,
     source_type: str | None = None,
     source_url: str | None = None,
+    owner_id: str | None = None,
     storage_profile: str = "legacy",
 ) -> Select[tuple[DocumentChunkRecord, DocumentRecord, Any]]:
     """Build a PostgreSQL pgvector cosine query with scope filters applied first."""
@@ -172,6 +173,8 @@ def build_similarity_query(
         statement = statement.where(DocumentRecord.source_type == source_type)
     if source_url is not None:
         statement = statement.where(DocumentRecord.source_url == source_url)
+    if owner_id is not None:
+        statement = statement.where(DocumentRecord.owner_id == owner_id)
     return statement.order_by(distance.asc()).limit(top_k)
 
 
@@ -188,6 +191,7 @@ def build_lexical_query(
     document_ids: list[str] | None = None,
     source_type: str | None = None,
     source_url: str | None = None,
+    owner_id: str | None = None,
 ) -> Select[tuple[DocumentChunkRecord, DocumentRecord, Any]]:
     """Build a PostgreSQL full-text candidate query with scope filters applied first."""
     document_tsv = _full_text_expression()
@@ -211,6 +215,8 @@ def build_lexical_query(
         statement = statement.where(DocumentRecord.source_type == source_type)
     if source_url is not None:
         statement = statement.where(DocumentRecord.source_url == source_url)
+    if owner_id is not None:
+        statement = statement.where(DocumentRecord.owner_id == owner_id)
     return statement.order_by(lexical_score.desc()).limit(top_k)
 
 
@@ -294,6 +300,7 @@ class VectorRetriever:
         document_ids: list[str] | None,
         source_type: str | None,
         source_url: str | None,
+        owner_id: str | None = None,
     ) -> list[RetrievedChunk]:
         query_vector = self._embed_query(query)
         statement = build_similarity_query(
@@ -305,6 +312,7 @@ class VectorRetriever:
             document_ids=document_ids,
             source_type=source_type,
             source_url=source_url,
+            owner_id=owner_id,
             storage_profile=getattr(self.embedding_service, "storage_profile", "legacy"),
         )
         try:
@@ -327,6 +335,7 @@ class VectorRetriever:
         document_ids: list[str] | None,
         source_type: str | None,
         source_url: str | None,
+        owner_id: str | None = None,
     ) -> list[RetrievedChunk]:
         statement = build_lexical_query(
             query.strip(),
@@ -335,6 +344,7 @@ class VectorRetriever:
             document_ids=document_ids,
             source_type=source_type,
             source_url=source_url,
+            owner_id=owner_id,
         )
         try:
             rows = self.session.execute(statement).all()
@@ -375,6 +385,7 @@ class VectorRetriever:
         document_ids: list[str] | None = None,
         source_type: str | None = None,
         source_url: str | None = None,
+        owner_id: str | None = None,
     ) -> list[RetrievedChunk]:
         """Return cosine-ranked candidates only (evaluation and comparison path)."""
         if not query.strip():
@@ -388,6 +399,7 @@ class VectorRetriever:
             document_ids=document_ids,
             source_type=source_type,
             source_url=source_url,
+            owner_id=owner_id,
         )
 
     def retrieve_lexical_only(
@@ -399,6 +411,7 @@ class VectorRetriever:
         document_ids: list[str] | None = None,
         source_type: str | None = None,
         source_url: str | None = None,
+        owner_id: str | None = None,
     ) -> list[RetrievedChunk]:
         """Return PostgreSQL full-text-ranked candidates without embedding the query."""
         if not query.strip() or not _lexical_query_string(query):
@@ -412,6 +425,7 @@ class VectorRetriever:
             document_ids=document_ids,
             source_type=source_type,
             source_url=source_url,
+            owner_id=owner_id,
         )
 
     def retrieve(
@@ -423,6 +437,7 @@ class VectorRetriever:
         document_ids: list[str] | None = None,
         source_type: str | None = None,
         source_url: str | None = None,
+        owner_id: str | None = None,
     ) -> list[RetrievedChunk]:
         """Return RRF-fused vector and lexical candidates within the requested scope."""
         if not query.strip():
@@ -440,6 +455,7 @@ class VectorRetriever:
             document_ids=document_ids,
             source_type=source_type,
             source_url=source_url,
+            owner_id=owner_id,
         )
         lexical_results = (
             self._execute_lexical_search(
@@ -449,6 +465,7 @@ class VectorRetriever:
                 document_ids=document_ids,
                 source_type=source_type,
                 source_url=source_url,
+                owner_id=owner_id,
             )
             if _lexical_query_string(query)
             else []

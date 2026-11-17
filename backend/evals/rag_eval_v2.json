@@ -1,0 +1,604 @@
+{
+  "version": "rag-eval-v2",
+  "embedding_profile": "sentence_transformers:sentence-transformers/all-MiniLM-L6-v2:dimensions=384",
+  "metadata": {
+    "description": "Enriched versioned RAG evaluation dataset covering webpages, document retrieval, multi-part queries, and abstention.",
+    "case_count": 22,
+    "corpus_count": 16,
+    "supported_query_count": 20,
+    "unsupported_query_count": 2,
+    "has_reference_answers": true
+  },
+  "corpus": [
+    {
+      "ref": "embeddings",
+      "document_id": "55cfc5f5-05ab-5fe4-9270-d557d88ca70b",
+      "chunk_id": "55cfc5f5-05ab-5fe4-9270-d557d88ca70b:chunk:0:0:260",
+      "source_type": "text",
+      "filename": "mini_embeddings.txt",
+      "title": "Embedding profile",
+      "text": "The configured local embedding model is sentence-transformers/all-MiniLM-L6-v2. It emits vectors with 384 dimensions. Embedding batches contain at most 64 texts. Legacy 1536-dimensional vectors are stored separately and are never mixed with this local profile."
+    },
+    {
+      "ref": "uploads",
+      "document_id": "89a8d2a4-ebc9-570b-8bba-c6cd95c14143",
+      "chunk_id": "89a8d2a4-ebc9-570b-8bba-c6cd95c14143:chunk:0:0:210",
+      "source_type": "text",
+      "filename": "upload_limits.txt",
+      "title": "Upload limits",
+      "text": "A document upload can be at most 25 MiB. The multipart request limit adds 256 KiB for framing overhead. Extracted text is limited to 100,000 characters, PDFs to 200 pages, and generated documents to 128 chunks."
+    },
+    {
+      "ref": "chunking",
+      "document_id": "6bced508-dee2-532e-a4a3-83a17b7786d3",
+      "chunk_id": "6bced508-dee2-532e-a4a3-83a17b7786d3:chunk:0:0:204",
+      "source_type": "text",
+      "filename": "chunking_rules.txt",
+      "title": "Chunking rules",
+      "text": "Document text is split into chunks of 1,200 characters with 150 characters of overlap. The chunker prefers paragraph boundaries, then sentence boundaries, then word boundaries, and records source offsets."
+    },
+    {
+      "ref": "retrieval",
+      "document_id": "8e81c704-4a20-5960-8930-5d7255d8baea",
+      "chunk_id": "8e81c704-4a20-5960-8930-5d7255d8baea:chunk:0:0:207",
+      "source_type": "text",
+      "filename": "retrieval_rules.txt",
+      "title": "Retrieval rules",
+      "text": "PageGlance retrieves five nearest chunks by PostgreSQL pgvector cosine similarity by default. It caps top-k overrides at 50 and applies source URL and document filters before sorting and limiting candidates."
+    },
+    {
+      "ref": "ocr",
+      "document_id": "beba7545-0b6c-5a7a-8fba-4adbbf9e8a15",
+      "chunk_id": "beba7545-0b6c-5a7a-8fba-4adbbf9e8a15:chunk:0:0:241",
+      "source_type": "text",
+      "filename": "ocr_rules.txt",
+      "title": "OCR limits",
+      "text": "Scanned PDF pages use PyMuPDF rendering and pytesseract to run the local Tesseract OCR executable. Pages with meaningful selectable text skip OCR. OCR is capped at 50 pages, 20 megapixels per page, 20 seconds per page, and 180 seconds total."
+    },
+    {
+      "ref": "extension",
+      "document_id": "f2a087ff-385a-5606-b59d-cf7f2f9be636",
+      "chunk_id": "f2a087ff-385a-5606-b59d-cf7f2f9be636:chunk:0:0:176",
+      "source_type": "text",
+      "filename": "extension_architecture.txt",
+      "title": "Extension architecture",
+      "text": "The Chrome extension uses React, TypeScript, Vite, and Manifest V3. Its content script extracts page title, URL, and readable body text, then sends typed messages to the popup."
+    },
+    {
+      "ref": "database",
+      "document_id": "569e7f39-5f27-58ed-9463-2ab2821964cd",
+      "chunk_id": "569e7f39-5f27-58ed-9463-2ab2821964cd:chunk:0:0:157",
+      "source_type": "text",
+      "filename": "database_storage.txt",
+      "title": "Database storage",
+      "text": "PageGlance stores documents and chunks in PostgreSQL through SQLAlchemy. Alembic manages schema changes, and pgvector provides vector columns for embeddings."
+    },
+    {
+      "ref": "history",
+      "document_id": "4a573818-fc5e-599c-aebd-d59df78434e7",
+      "chunk_id": "4a573818-fc5e-599c-aebd-d59df78434e7:chunk:0:0:188",
+      "source_type": "text",
+      "filename": "conversation_history.txt",
+      "title": "Conversation history",
+      "text": "The chat interface persists drafts, messages, and themes in Chrome local storage. Webpage conversations are separated by normalized page URL, while document conversations use document IDs."
+    },
+    {
+      "ref": "active_page",
+      "document_id": "94c98b7d-eb8a-59c6-8efa-8204631889c4",
+      "chunk_id": "94c98b7d-eb8a-59c6-8efa-8204631889c4:chunk:0:0:90",
+      "source_type": "webpage",
+      "source_url": "https://eval.pageglance.invalid/active",
+      "title": "Active evaluation page",
+      "text": "The active page says the blue widget valve is made of brass and should be checked monthly."
+    },
+    {
+      "ref": "unrelated_page",
+      "document_id": "085314c4-0953-51a3-89d7-49989825424b",
+      "chunk_id": "085314c4-0953-51a3-89d7-49989825424b:chunk:0:0:93",
+      "source_type": "webpage",
+      "source_url": "https://eval.pageglance.invalid/unrelated",
+      "title": "Unrelated evaluation page",
+      "text": "The unrelated page says the red widget handle is made of steel and should be replaced yearly."
+    },
+    {
+      "ref": "reranker",
+      "document_id": "9873e050-ee11-53af-82af-bafb12b30964",
+      "chunk_id": "9873e050-ee11-53af-82af-bafb12b30964:chunk:0:0:269",
+      "source_type": "text",
+      "filename": "reranker_rules.txt",
+      "title": "Reranker configuration",
+      "text": "The optional cross-encoder reranker uses sentence-transformers with model cross-encoder/ms-marco-MiniLM-L-6-v2 on CPU. When PAGEGLANCE_RERANKER_ENABLED is true, it reranks the top 20 candidate chunks. Candidates are scored as query-passage pairs and truncated to top-k."
+    },
+    {
+      "ref": "hybrid_search",
+      "document_id": "7387fb0a-6e0a-5b6c-a867-d77c0962cd99",
+      "chunk_id": "7387fb0a-6e0a-5b6c-a867-d77c0962cd99:chunk:0:0:265",
+      "source_type": "text",
+      "filename": "hybrid_search.txt",
+      "title": "Hybrid search fusion",
+      "text": "Hybrid search executes vector cosine similarity and PostgreSQL full-text search, then merges candidate lists with Reciprocal Rank Fusion. The RRF rank constant defaults to 60. Lexical queries use to_tsvector with simple regconfig and a GIN index on document chunks."
+    },
+    {
+      "ref": "streaming",
+      "document_id": "4d14ae3b-6207-57ec-8eef-276f6838b4ce",
+      "chunk_id": "4d14ae3b-6207-57ec-8eef-276f6838b4ce:chunk:0:0:292",
+      "source_type": "text",
+      "filename": "streaming_events.txt",
+      "title": "Streaming events",
+      "text": "The POST /ask/stream endpoint yields Server-Sent Events with event types sources, token, replace, and done. Grounded citation validation verifies that factual claims cite source identifiers like [S1]. If required citations are missing, a replace event substitutes a verified evidence refusal."
+    },
+    {
+      "ref": "multi_document",
+      "document_id": "f82b0d7b-154e-59ea-89ac-dd9b2ced46fe",
+      "chunk_id": "f82b0d7b-154e-59ea-89ac-dd9b2ced46fe:chunk:0:0:262",
+      "source_type": "text",
+      "filename": "multi_document_rules.txt",
+      "title": "Multi-document scoping",
+      "text": "PageGlance supports multi-document queries with document_ids containing at most five unique document identifiers. Scoping verifies each identifier is an uploaded text or PDF document. Any retrieved chunk outside the requested document identifier set is rejected."
+    },
+    {
+      "ref": "content_script",
+      "document_id": "e16731f5-3750-5fb6-bd80-0f325cd5023b",
+      "chunk_id": "e16731f5-3750-5fb6-bd80-0f325cd5023b:chunk:0:0:230",
+      "source_type": "text",
+      "filename": "content_script.txt",
+      "title": "Content script extraction",
+      "text": "The Chrome extension content script listens for the PAGEGLANCE_EXTRACT_PAGE message. It extracts the document title, current URL, and document body innerText trimmed up to 100,000 characters, returning them to the extension popup."
+    },
+    {
+      "ref": "prompt_safety",
+      "document_id": "3f674280-d868-51e1-83d6-6882f43070ac",
+      "chunk_id": "3f674280-d868-51e1-83d6-6882f43070ac:chunk:0:0:279",
+      "source_type": "text",
+      "filename": "prompt_safety.txt",
+      "title": "Prompt safety instructions",
+      "text": "RAG system instructions treat page text, URLs, and retrieved chunks as untrusted external data. The prompt directs the language model never to follow directives, role changes, or secret requests found in evidence, and to cite evidence sources using literal ASCII square brackets."
+    }
+  ],
+  "cases": [
+    {
+      "id": "exact-model-identifier",
+      "category": "exact_identifier",
+      "question": "What is the exact identifier of the local embedding model?",
+      "scope": {
+        "source_type": "text"
+      },
+      "relevant_chunk_ids": [
+        "55cfc5f5-05ab-5fe4-9270-d557d88ca70b:chunk:0:0:260"
+      ],
+      "reference_facts": [
+        "sentence-transformers/all-MiniLM-L6-v2",
+        "384 dimensions"
+      ],
+      "reference": "The configured local embedding model is sentence-transformers/all-MiniLM-L6-v2.",
+      "expected_citations": [
+        "55cfc5f5-05ab-5fe4-9270-d557d88ca70b:chunk:0:0:260"
+      ],
+      "expected_abstention": false
+    },
+    {
+      "id": "numeric-vector-profile",
+      "category": "numeric_specification",
+      "question": "How wide are the vectors, and how many texts are embedded in one batch at most?",
+      "scope": {
+        "source_type": "text"
+      },
+      "relevant_chunk_ids": [
+        "55cfc5f5-05ab-5fe4-9270-d557d88ca70b:chunk:0:0:260"
+      ],
+      "reference_facts": [
+        "384 dimensions",
+        "64 texts per batch"
+      ],
+      "reference": "The vectors have 384 dimensions, and embedding batches contain at most 64 texts.",
+      "expected_citations": [
+        "55cfc5f5-05ab-5fe4-9270-d557d88ca70b:chunk:0:0:260"
+      ],
+      "expected_abstention": false
+    },
+    {
+      "id": "numeric-upload-bounds",
+      "category": "numeric_specification",
+      "question": "What are the upload file limit and extra multipart allowance?",
+      "scope": {
+        "source_type": "text"
+      },
+      "relevant_chunk_ids": [
+        "89a8d2a4-ebc9-570b-8bba-c6cd95c14143:chunk:0:0:210"
+      ],
+      "reference_facts": [
+        "25 MiB per file",
+        "256 KiB multipart overhead"
+      ],
+      "reference": "A document upload can be at most 25 MiB, and the multipart request limit adds 256 KiB for framing overhead.",
+      "expected_citations": [
+        "89a8d2a4-ebc9-570b-8bba-c6cd95c14143:chunk:0:0:210"
+      ],
+      "expected_abstention": false
+    },
+    {
+      "id": "paraphrase-chunk-boundary",
+      "category": "paraphrase",
+      "question": "How does splitting preserve nearby context without cutting sentences or paragraphs arbitrarily?",
+      "scope": {
+        "source_type": "text"
+      },
+      "relevant_chunk_ids": [
+        "6bced508-dee2-532e-a4a3-83a17b7786d3:chunk:0:0:204"
+      ],
+      "reference_facts": [
+        "1,200-character chunks",
+        "150-character overlap",
+        "paragraph then sentence then word boundaries"
+      ],
+      "reference": "Document text is split into chunks of 1,200 characters with 150 characters of overlap, preferring paragraph boundaries, then sentence boundaries, then word boundaries.",
+      "expected_citations": [
+        "6bced508-dee2-532e-a4a3-83a17b7786d3:chunk:0:0:204"
+      ],
+      "expected_abstention": false
+    },
+    {
+      "id": "paraphrase-page-ranking",
+      "category": "paraphrase",
+      "question": "How are the closest passages found without returning material from another page?",
+      "scope": {
+        "source_type": "text"
+      },
+      "relevant_chunk_ids": [
+        "8e81c704-4a20-5960-8930-5d7255d8baea:chunk:0:0:207"
+      ],
+      "reference_facts": [
+        "pgvector cosine similarity",
+        "source URL and document filters before ranking"
+      ],
+      "reference": "PageGlance retrieves five nearest chunks by PostgreSQL pgvector cosine similarity by default, applying source URL and document filters before sorting and limiting candidates.",
+      "expected_citations": [
+        "8e81c704-4a20-5960-8930-5d7255d8baea:chunk:0:0:207"
+      ],
+      "expected_abstention": false
+    },
+    {
+      "id": "unsupported-author",
+      "category": "unsupported",
+      "question": "Who originally created the PageGlance product?",
+      "scope": {
+        "source_type": "text"
+      },
+      "relevant_chunk_ids": [],
+      "reference_facts": [],
+      "reference": null,
+      "expected_citations": [],
+      "expected_abstention": true
+    },
+    {
+      "id": "active-url-isolation",
+      "category": "source_isolation",
+      "question": "What material is used for the valve described on this page?",
+      "scope": {
+        "source_url": "https://eval.pageglance.invalid/active"
+      },
+      "relevant_chunk_ids": [
+        "94c98b7d-eb8a-59c6-8efa-8204631889c4:chunk:0:0:90"
+      ],
+      "reference_facts": [
+        "The blue widget valve is made of brass"
+      ],
+      "reference": "The blue widget valve is made of brass and should be checked monthly.",
+      "expected_citations": [
+        "94c98b7d-eb8a-59c6-8efa-8204631889c4:chunk:0:0:90"
+      ],
+      "expected_abstention": false,
+      "forbidden_document_ids": [
+        "085314c4-0953-51a3-89d7-49989825424b"
+      ]
+    },
+    {
+      "id": "unrelated-url-isolation",
+      "category": "source_isolation",
+      "question": "What material is used for the handle on this page?",
+      "scope": {
+        "source_url": "https://eval.pageglance.invalid/unrelated"
+      },
+      "relevant_chunk_ids": [
+        "085314c4-0953-51a3-89d7-49989825424b:chunk:0:0:93"
+      ],
+      "reference_facts": [
+        "The red widget handle is made of steel"
+      ],
+      "reference": "The red widget handle is made of steel and should be replaced yearly.",
+      "expected_citations": [
+        "085314c4-0953-51a3-89d7-49989825424b:chunk:0:0:93"
+      ],
+      "expected_abstention": false,
+      "forbidden_document_ids": [
+        "94c98b7d-eb8a-59c6-8efa-8204631889c4"
+      ]
+    },
+    {
+      "id": "ocr-scanned-page-bounds",
+      "category": "numeric_specification",
+      "question": "What are the limits on page count, pixel area, and processing time for OCR?",
+      "scope": {
+        "source_type": "text"
+      },
+      "relevant_chunk_ids": [
+        "beba7545-0b6c-5a7a-8fba-4adbbf9e8a15:chunk:0:0:241"
+      ],
+      "reference_facts": [
+        "50 pages",
+        "20 megapixels per page",
+        "20 seconds per page",
+        "180 seconds total"
+      ],
+      "reference": "OCR is capped at 50 pages, 20 megapixels per page, 20 seconds per page, and 180 seconds total.",
+      "expected_citations": [
+        "beba7545-0b6c-5a7a-8fba-4adbbf9e8a15:chunk:0:0:241"
+      ],
+      "expected_abstention": false
+    },
+    {
+      "id": "ocr-engine-requirements",
+      "category": "exact_identifier",
+      "question": "What tools and libraries perform text recognition on scanned PDF pages?",
+      "scope": {
+        "source_type": "text"
+      },
+      "relevant_chunk_ids": [
+        "beba7545-0b6c-5a7a-8fba-4adbbf9e8a15:chunk:0:0:241"
+      ],
+      "reference_facts": [
+        "PyMuPDF rendering",
+        "pytesseract",
+        "Tesseract OCR executable"
+      ],
+      "reference": "Scanned PDF pages use PyMuPDF rendering and pytesseract to run the local Tesseract OCR executable.",
+      "expected_citations": [
+        "beba7545-0b6c-5a7a-8fba-4adbbf9e8a15:chunk:0:0:241"
+      ],
+      "expected_abstention": false
+    },
+    {
+      "id": "extension-frontend-stack",
+      "category": "exact_identifier",
+      "question": "What frontend technologies and manifest standard are used in the Chrome extension?",
+      "scope": {
+        "source_type": "text"
+      },
+      "relevant_chunk_ids": [
+        "f2a087ff-385a-5606-b59d-cf7f2f9be636:chunk:0:0:176"
+      ],
+      "reference_facts": [
+        "React",
+        "TypeScript",
+        "Vite",
+        "Manifest V3"
+      ],
+      "reference": "The Chrome extension uses React, TypeScript, Vite, and Manifest V3.",
+      "expected_citations": [
+        "f2a087ff-385a-5606-b59d-cf7f2f9be636:chunk:0:0:176"
+      ],
+      "expected_abstention": false
+    },
+    {
+      "id": "database-technology-stack",
+      "category": "exact_identifier",
+      "question": "Which database and ORM framework store documents and vector columns?",
+      "scope": {
+        "source_type": "text"
+      },
+      "relevant_chunk_ids": [
+        "569e7f39-5f27-58ed-9463-2ab2821964cd:chunk:0:0:157"
+      ],
+      "reference_facts": [
+        "PostgreSQL",
+        "SQLAlchemy",
+        "Alembic",
+        "pgvector"
+      ],
+      "reference": "PageGlance stores documents and chunks in PostgreSQL through SQLAlchemy, with Alembic managing schema changes and pgvector providing vector columns for embeddings.",
+      "expected_citations": [
+        "569e7f39-5f27-58ed-9463-2ab2821964cd:chunk:0:0:157"
+      ],
+      "expected_abstention": false
+    },
+    {
+      "id": "conversation-history-storage",
+      "category": "paraphrase",
+      "question": "How does PageGlance preserve chat history and keep different chats separate?",
+      "scope": {
+        "source_type": "text"
+      },
+      "relevant_chunk_ids": [
+        "4a573818-fc5e-599c-aebd-d59df78434e7:chunk:0:0:188"
+      ],
+      "reference_facts": [
+        "Chrome local storage",
+        "normalized page URL for webpages",
+        "document IDs for documents"
+      ],
+      "reference": "The chat interface persists drafts, messages, and themes in Chrome local storage, separating webpage conversations by normalized page URL and document conversations by document ID.",
+      "expected_citations": [
+        "4a573818-fc5e-599c-aebd-d59df78434e7:chunk:0:0:188"
+      ],
+      "expected_abstention": false
+    },
+    {
+      "id": "reranker-model-specification",
+      "category": "exact_identifier",
+      "question": "Which cross-encoder model reranks retrieval results, and how many candidates are processed?",
+      "scope": {
+        "source_type": "text"
+      },
+      "relevant_chunk_ids": [
+        "9873e050-ee11-53af-82af-bafb12b30964:chunk:0:0:269"
+      ],
+      "reference_facts": [
+        "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        "top 20 candidate chunks"
+      ],
+      "reference": "The optional cross-encoder reranker uses sentence-transformers with model cross-encoder/ms-marco-MiniLM-L-6-v2 on CPU to rerank the top 20 candidate chunks.",
+      "expected_citations": [
+        "9873e050-ee11-53af-82af-bafb12b30964:chunk:0:0:269"
+      ],
+      "expected_abstention": false
+    },
+    {
+      "id": "hybrid-fusion-algorithm",
+      "category": "exact_identifier",
+      "question": "How does hybrid search combine vector and lexical results, and what is the RRF constant?",
+      "scope": {
+        "source_type": "text"
+      },
+      "relevant_chunk_ids": [
+        "7387fb0a-6e0a-5b6c-a867-d77c0962cd99:chunk:0:0:265"
+      ],
+      "reference_facts": [
+        "Reciprocal Rank Fusion",
+        "RRF rank constant 60",
+        "to_tsvector simple regconfig",
+        "GIN index"
+      ],
+      "reference": "Hybrid search combines vector cosine similarity and PostgreSQL full-text search using Reciprocal Rank Fusion with a default RRF rank constant of 60.",
+      "expected_citations": [
+        "7387fb0a-6e0a-5b6c-a867-d77c0962cd99:chunk:0:0:265"
+      ],
+      "expected_abstention": false
+    },
+    {
+      "id": "streaming-sse-event-types",
+      "category": "exact_identifier",
+      "question": "What Server-Sent Event types are streamed to the client during an ask request?",
+      "scope": {
+        "source_type": "text"
+      },
+      "relevant_chunk_ids": [
+        "4d14ae3b-6207-57ec-8eef-276f6838b4ce:chunk:0:0:292"
+      ],
+      "reference_facts": [
+        "sources",
+        "token",
+        "replace",
+        "done"
+      ],
+      "reference": "The POST /ask/stream endpoint yields Server-Sent Events with event types sources, token, replace, and done.",
+      "expected_citations": [
+        "4d14ae3b-6207-57ec-8eef-276f6838b4ce:chunk:0:0:292"
+      ],
+      "expected_abstention": false
+    },
+    {
+      "id": "groundedness-citation-rule",
+      "category": "paraphrase",
+      "question": "How are citations verified in generated answers, and what happens when they are missing?",
+      "scope": {
+        "source_type": "text"
+      },
+      "relevant_chunk_ids": [
+        "4d14ae3b-6207-57ec-8eef-276f6838b4ce:chunk:0:0:292"
+      ],
+      "reference_facts": [
+        "bracketed source identifiers like [S1]",
+        "replace event substitutes verified evidence refusal"
+      ],
+      "reference": "Grounded citation validation verifies that factual claims cite source identifiers like [S1]; if required citations are missing, a replace event substitutes a verified evidence refusal.",
+      "expected_citations": [
+        "4d14ae3b-6207-57ec-8eef-276f6838b4ce:chunk:0:0:292"
+      ],
+      "expected_abstention": false
+    },
+    {
+      "id": "multi-document-limit",
+      "category": "numeric_specification",
+      "question": "How many document IDs may be selected at once, and how is retrieval restricted?",
+      "scope": {
+        "source_type": "text"
+      },
+      "relevant_chunk_ids": [
+        "f82b0d7b-154e-59ea-89ac-dd9b2ced46fe:chunk:0:0:262"
+      ],
+      "reference_facts": [
+        "at most five unique document identifiers",
+        "uploaded text or PDF document",
+        "rejects outside chunks"
+      ],
+      "reference": "PageGlance supports multi-document queries with at most five unique document identifiers, scoping retrieval to uploaded text or PDF documents and rejecting any chunk outside that set.",
+      "expected_citations": [
+        "f82b0d7b-154e-59ea-89ac-dd9b2ced46fe:chunk:0:0:262"
+      ],
+      "expected_abstention": false
+    },
+    {
+      "id": "content-script-extraction-bounds",
+      "category": "numeric_specification",
+      "question": "Which message extracts webpage content, and what is the character limit on extracted text?",
+      "scope": {
+        "source_type": "text"
+      },
+      "relevant_chunk_ids": [
+        "e16731f5-3750-5fb6-bd80-0f325cd5023b:chunk:0:0:230"
+      ],
+      "reference_facts": [
+        "PAGEGLANCE_EXTRACT_PAGE",
+        "100,000 characters"
+      ],
+      "reference": "The content script listens for the PAGEGLANCE_EXTRACT_PAGE message and extracts trimmed document body innerText up to 100,000 characters.",
+      "expected_citations": [
+        "e16731f5-3750-5fb6-bd80-0f325cd5023b:chunk:0:0:230"
+      ],
+      "expected_abstention": false
+    },
+    {
+      "id": "prompt-untrusted-data-rules",
+      "category": "paraphrase",
+      "question": "How does the system prompt defend against prompt injections in retrieved evidence?",
+      "scope": {
+        "source_type": "text"
+      },
+      "relevant_chunk_ids": [
+        "3f674280-d868-51e1-83d6-6882f43070ac:chunk:0:0:279"
+      ],
+      "reference_facts": [
+        "untrusted external data",
+        "never follow directives, role changes, or secret requests"
+      ],
+      "reference": "RAG system instructions treat page text, URLs, and retrieved chunks as untrusted external data, directing the model never to follow directives, role changes, or secret requests found in evidence.",
+      "expected_citations": [
+        "3f674280-d868-51e1-83d6-6882f43070ac:chunk:0:0:279"
+      ],
+      "expected_abstention": false
+    },
+    {
+      "id": "unsupported-pricing",
+      "category": "unsupported",
+      "question": "How much does a monthly enterprise subscription to PageGlance cost?",
+      "scope": {
+        "source_type": "text"
+      },
+      "relevant_chunk_ids": [],
+      "reference_facts": [],
+      "reference": null,
+      "expected_citations": [],
+      "expected_abstention": true
+    },
+    {
+      "id": "multi-part-limits",
+      "category": "multi_part",
+      "question": "What is the maximum extracted text length, and how many chunks can a document generate at most?",
+      "scope": {
+        "source_type": "text"
+      },
+      "relevant_chunk_ids": [
+        "89a8d2a4-ebc9-570b-8bba-c6cd95c14143:chunk:0:0:210"
+      ],
+      "reference_facts": [
+        "100,000 characters extracted text",
+        "128 chunks"
+      ],
+      "reference": "Extracted text is limited to 100,000 characters, and generated documents are limited to 128 chunks.",
+      "expected_citations": [
+        "89a8d2a4-ebc9-570b-8bba-c6cd95c14143:chunk:0:0:210"
+      ],
+      "expected_abstention": false
+    }
+  ]
+}

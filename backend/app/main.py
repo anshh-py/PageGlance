@@ -1,3 +1,4 @@
+from app import langsmith_tracing
 """FastAPI application entry point."""
 
 import json
@@ -7,7 +8,7 @@ from collections.abc import AsyncIterator
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from groq import APIConnectionError, APIStatusError, APITimeoutError, GroqError, RateLimitError
@@ -15,6 +16,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
+from app.auth import Installation, register_installation, require_installation
 from app.db import DatabaseConfigurationError
 from app.document_ingestion import (
     UploadProcessingError,
@@ -32,13 +34,17 @@ from app.llm import (
     stream_answer,
 )
 from app.page_indexing import get_ingestion_session_factory, index_page_context
+from app.ratelimit import RateLimiter, is_rate_limiting_enabled
 from app.rag import rag_orchestrator
 from app.repository import DocumentRepository
 from app.upload_limits import UploadBodyLimitMiddleware, get_max_upload_bytes, get_max_upload_mb
 from app.url_identity import normalize_page_url
+from app.html_extractor import extract_html_text
+from app.url_fetcher import FetchError, fetch_url
 
 app = FastAPI(title="PageGlance API", version="0.1.0")
 logger = logging.getLogger(__name__)
+rate_limiter = RateLimiter()
 _UPLOAD_ERROR_DETAILS = {
     "database_configuration_error": (
         "The backend database is not configured. "
@@ -113,11 +119,17 @@ _GENERIC_UPLOAD_ERROR = "Document ingestion is temporarily unavailable. Please t
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_origin_regex=r"chrome-extension://.*",
-    allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type"],
+    allow_origin_regex=r"chrome-extension://.*|moz-extension://.*",
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 app.add_middleware(UploadBodyLimitMiddleware)
+
+
+class RegisterRequest(BaseModel):
+    """Token presented by an installation on first contact. Only its hash is stored."""
+
+    token: str = Field(min_length=32, max_length=256)
 
 
 class PageContext(BaseModel):
@@ -127,6 +139,7 @@ class PageContext(BaseModel):
     url: str = Field(max_length=4000)
     text: str = Field(max_length=100_000)
     document_id: str | None = Field(default=None, min_length=1, max_length=36)
+    blocks: list[dict] = Field(default_factory=list)
 
     @field_validator("url")
     @classmethod
@@ -216,6 +229,20 @@ class AskResponse(BaseModel):
 
     answer: str
     sources: list[AnswerSource] | None = None
+
+
+class IngestUrlRequest(BaseModel):
+    """Validated URL to fetch and index server-side."""
+
+    url: str = Field(min_length=1, max_length=4000)
+
+    @field_validator("url")
+    @classmethod
+    def strip_url(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("URL must contain text.")
+        return value
 
 
 class DocumentChunkStats(BaseModel):
@@ -331,7 +358,7 @@ def _format_document_diagnostics(
     return "\n".join(lines)
 
 
-def _document_diagnostic_answer(request: AskRequest, prepared) -> str | None:
+def _document_diagnostic_answer(request: AskRequest, prepared, *, owner_id: str | None = None) -> str | None:
     if not _document_diagnostics_question(request.question):
         return None
     if request.document_ids is not None:
@@ -341,15 +368,17 @@ def _document_diagnostic_answer(request: AskRequest, prepared) -> str | None:
         )
     if request.document_id is None:
         return None
-    stats = _load_document_stats(request.document_id)
+    stats = _load_document_stats(request.document_id, owner_id=owner_id)
     return _format_document_diagnostics(request.question, stats, prepared.retrieved_sources)
 
 
-def _prepare_page_answer_context(request: AskRequest, context_limit: int):
+def _prepare_page_answer_context(request: AskRequest, context_limit: int, *, owner_id: str | None = None):
     """Index the active page, then retrieve only from that successfully indexed page."""
     if request.page is None:
         raise ValueError("A webpage context is required for page retrieval.")
     request_page = request.page.model_dump()
+    if owner_id is not None:
+        request_page["_owner_id"] = owner_id
     page = request.page.model_dump(exclude={"document_id"})
     indexed = index_page_context(request_page)
     if not indexed.indexed:
@@ -365,16 +394,19 @@ def _prepare_page_answer_context(request: AskRequest, context_limit: int):
         document_id=indexed.document_id if indexed.indexed else None,
         retrieval_enabled=indexed.indexed,
         fallback_code=indexed.fallback_code,
+        owner_id=owner_id,
     )
 
 
-def _prepare_document_answer_context(request: AskRequest, context_limit: int):
+def _prepare_document_answer_context(request: AskRequest, context_limit: int, *, owner_id: str | None = None):
     """Validate and retrieve only the selected uploaded TXT/PDF document."""
     if request.document_id is None:
         raise ValueError("A document identifier is required for document retrieval.")
     try:
         with get_ingestion_session_factory()() as session:
-            document = DocumentRepository(session).get_by_id(request.document_id)
+            document = DocumentRepository(session).get_by_id(
+                request.document_id, owner_id=owner_id
+            )
     except (DatabaseConfigurationError, SQLAlchemyError):
         raise HTTPException(
             status_code=503,
@@ -397,6 +429,7 @@ def _prepare_document_answer_context(request: AskRequest, context_limit: int):
         context_limit=context_limit,
         document_id=request.document_id,
         retrieval_enabled=True,
+        owner_id=owner_id,
     )
     if not prepared.retrieval_used:
         if prepared.fallback_code == "no_indexed_content":
@@ -418,14 +451,17 @@ def _prepare_document_answer_context(request: AskRequest, context_limit: int):
     return prepared
 
 
-def _prepare_multi_document_context(request: AskRequest, context_limit: int):
+def _prepare_multi_document_context(request: AskRequest, context_limit: int, *, owner_id: str | None = None):
     """Validate a small explicit document set and retrieve strictly within that set."""
     document_ids = request.document_ids
     if not document_ids:
         raise ValueError("A document identifier list is required for document retrieval.")
     try:
         with get_ingestion_session_factory()() as session:
-            documents = [DocumentRepository(session).get_by_id(item) for item in document_ids]
+            documents = [
+                DocumentRepository(session).get_by_id(item, owner_id=owner_id)
+                for item in document_ids
+            ]
     except (DatabaseConfigurationError, SQLAlchemyError):
         raise HTTPException(
             status_code=503,
@@ -443,6 +479,7 @@ def _prepare_multi_document_context(request: AskRequest, context_limit: int):
         context_limit=context_limit,
         document_ids=document_ids,
         retrieval_enabled=True,
+        owner_id=owner_id,
     )
     allowed = set(document_ids)
     if not prepared.retrieval_used or not prepared.retrieved_sources:
@@ -457,12 +494,12 @@ def _prepare_multi_document_context(request: AskRequest, context_limit: int):
     return prepared
 
 
-def _prepare_answer_context(request: AskRequest, context_limit: int):
+def _prepare_answer_context(request: AskRequest, context_limit: int, *, owner_id: str | None = None):
     if request.document_ids is not None:
-        return _prepare_multi_document_context(request, context_limit)
+        return _prepare_multi_document_context(request, context_limit, owner_id=owner_id)
     if request.document_id is not None:
-        return _prepare_document_answer_context(request, context_limit)
-    return _prepare_page_answer_context(request, context_limit)
+        return _prepare_document_answer_context(request, context_limit, owner_id=owner_id)
+    return _prepare_page_answer_context(request, context_limit, owner_id=owner_id)
 
 
 _CITATION_REFERENCE = re.compile(r"\[([A-Z][0-9]*)\]")
@@ -568,6 +605,14 @@ def _citation_sources(sources: list[dict[str, object]] | None) -> list[AnswerSou
     return citations
 
 
+def _enforce_rate_limit(request: Request, installation: Installation, action: str) -> None:
+    """Apply installation-keyed (plus IP backstop) rate limits when enabled."""
+    if not is_rate_limiting_enabled():
+        return
+    rate_limiter.check_installation(installation.id, action)
+    rate_limiter.check_ip(request)
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     """Return basic service health."""
@@ -575,10 +620,21 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-def _load_document_stats(document_id: str) -> DocumentStatsResponse:
+@app.post("/auth/register")
+def register_installation_endpoint(register_request_body: RegisterRequest, request: Request) -> dict[str, str]:
+    """Register an installation token (idempotent). Only its hash is stored."""
+    if is_rate_limiting_enabled():
+        rate_limiter.check_ip(request, "register")
+    installation = register_installation(register_request_body.token)
+    return {"installation_id": installation.id}
+
+
+def _load_document_stats(document_id: str, *, owner_id: str | None = None) -> DocumentStatsResponse:
     try:
         with get_ingestion_session_factory()() as session:
-            document = DocumentRepository(session).get_by_id(document_id)
+            document = DocumentRepository(session).get_by_id(
+                document_id, owner_id=owner_id
+            )
     except (DatabaseConfigurationError, SQLAlchemyError):
         raise HTTPException(
             status_code=503, detail="Document statistics are temporarily unavailable."
@@ -589,14 +645,46 @@ def _load_document_stats(document_id: str) -> DocumentStatsResponse:
 
 
 @app.get("/documents/{document_id}/stats", response_model=DocumentStatsResponse)
-def get_document_stats(document_id: UUID) -> DocumentStatsResponse:
+def get_document_stats(
+    document_id: UUID,
+    request: Request,
+    installation: Installation = Depends(require_installation),
+) -> DocumentStatsResponse:
     """Return persisted chunk/page metadata for one uploaded document only."""
-    return _load_document_stats(str(document_id))
+    _enforce_rate_limit(request, installation, "stats")
+    return _load_document_stats(str(document_id), owner_id=installation.id)
+
+
+@app.delete("/documents/{document_id}", status_code=204)
+def delete_document(
+    document_id: UUID, installation: Installation = Depends(require_installation)
+) -> None:
+    """Delete an owned document and all its chunks/vectors.
+
+    Returns 204 on success and a safe 404 when the document does not exist or
+    belongs to another installation (owner existence is never disclosed).
+    """
+    try:
+        with get_ingestion_session_factory()() as session:
+            deleted = DocumentRepository(session).delete_by_id(
+                str(document_id), owner_id=installation.id
+            )
+    except (DatabaseConfigurationError, SQLAlchemyError):
+        raise HTTPException(
+            status_code=503, detail="Could not delete the document right now."
+        ) from None
+    if not deleted:
+        raise HTTPException(status_code=404, detail="The selected document was not found.")
 
 
 @app.post("/documents/upload")
-async def upload_document(file: Annotated[UploadFile, File()]) -> dict[str, object]:
+async def upload_document(
+    file: Annotated[UploadFile, File()],
+    request: Request,
+    installation: Installation = Depends(require_installation),
+) -> dict[str, object]:
     """Index a bounded TXT or text-based PDF without changing chat contracts."""
+    _enforce_rate_limit(request, installation, "upload")
     try:
         max_upload_bytes = get_max_upload_bytes()
         file.file.seek(0, 2)
@@ -608,7 +696,9 @@ async def upload_document(file: Annotated[UploadFile, File()]) -> dict[str, obje
                 f"Files must be {get_max_upload_mb()} MiB or smaller.",
                 413,
             )
-        saved = await run_in_threadpool(ingest_uploaded_file, file.filename, file.file)
+        saved = await run_in_threadpool(
+            ingest_uploaded_file, file.filename, file.file, owner_id=installation.id
+        )
     except UploadValidationError as error:
         raise HTTPException(status_code=error.status_code, detail=error.detail) from None
     except UploadProcessingError as error:
@@ -634,14 +724,59 @@ async def upload_document(file: Annotated[UploadFile, File()]) -> dict[str, obje
     }
 
 
-@app.post("/ask", response_model=AskResponse, response_model_exclude_none=True)
-def ask(request: AskRequest) -> AskResponse:
-    """Answer a page question using the configured hosted language model."""
+@app.post("/ingest/url")
+async def ingest_url(
+    request: IngestUrlRequest,
+    http_request: Request,
+    installation: Installation = Depends(require_installation),
+) -> dict[str, object]:
+    """Fetch and index a server-side URL using the shared ingestion pipeline."""
+    _enforce_rate_limit(http_request, installation, "ingest_url")
+    try:
+        page_url = normalize_page_url(request.url)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
 
     try:
-        context_limit = get_context_max_chars()
-        prepared = _prepare_answer_context(request, context_limit)
-        diagnostic_answer = _document_diagnostic_answer(request, prepared)
+        response = await fetch_url(page_url)
+    except FetchError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.message) from None
+
+    extracted = extract_html_text(response.content, base_url=str(response.url))
+    indexed = index_page_context(
+        {
+            "title": extracted["title"],
+            "url": page_url,
+            "text": extracted["text"],
+            "_owner_id": installation.id,
+        }
+    )
+    return {
+        "document_id": indexed.document_id,
+        "chunk_count": indexed.chunk_count,
+        "title": extracted["title"],
+        "source_url": page_url,
+        "indexed": indexed.indexed,
+        "fallback_code": indexed.fallback_code,
+    }
+
+
+@app.post("/ask", response_model=AskResponse, response_model_exclude_none=True)
+def ask(
+    request: AskRequest,
+    http_request: Request,
+    installation: Installation = Depends(require_installation),
+) -> AskResponse:
+    """Answer a page question using the configured hosted language model."""
+
+    _enforce_rate_limit(http_request, installation, "ask")
+    try:
+        with langsmith_tracing.trace_run(name='pageglance.context.prepare', run_type='chain'):
+            context_limit = get_context_max_chars()
+            prepared = _prepare_answer_context(request, context_limit, owner_id=installation.id)
+        diagnostic_answer = _document_diagnostic_answer(
+            request, prepared, owner_id=installation.id
+        )
         page_text_chars = len(request.page.text) if request.page else 0
         logger.info(
             "ask_context page_text_chars=%d selected_chars=%d context_limit_chars=%d "
@@ -657,13 +792,15 @@ def ask(request: AskRequest) -> AskResponse:
             answer = diagnostic_answer
         else:
             history_max_messages, history_max_chars = get_history_limits()
-            answer = get_answer_service().answer(
+            with langsmith_tracing.trace_run(name='pageglance.llm.generation', run_type='llm'):
+                answer = get_answer_service().answer(
                 request.question,
                 prepared.page_context,
                 _bounded_history(request.history, history_max_messages, history_max_chars),
                 prepared.retrieved_sources,
             )
-            answer = _validate_grounded_answer(
+            with langsmith_tracing.trace_run(name='pageglance.citation.validation', run_type='chain'):
+                answer = _validate_grounded_answer(
                 answer, prepared.retrieved_sources, prepared.page_context
             )
     except LLMConfigurationError as error:
@@ -806,16 +943,25 @@ async def _answer_events(
 
 
 @app.post("/ask/stream")
-async def ask_stream(request: AskRequest) -> StreamingResponse:
+async def ask_stream(
+    request: AskRequest,
+    http_request: Request,
+    installation: Installation = Depends(require_installation),
+) -> StreamingResponse:
     """Stream generated answer deltas as Server-Sent Events."""
 
+    _enforce_rate_limit(http_request, installation, "ask_stream")
     try:
         settings = get_settings()
     except LLMConfigurationError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
 
-    prepared = await run_in_threadpool(_prepare_answer_context, request, settings.context_max_chars)
-    diagnostic_answer = await run_in_threadpool(_document_diagnostic_answer, request, prepared)
+    prepared = await run_in_threadpool(
+        _prepare_answer_context, request, settings.context_max_chars, owner_id=installation.id
+    )
+    diagnostic_answer = await run_in_threadpool(
+        _document_diagnostic_answer, request, prepared, owner_id=installation.id
+    )
     page_text_chars = len(request.page.text) if request.page else 0
     logger.info(
         "ask_stream_context page_text_chars=%d selected_chars=%d context_limit_chars=%d "
@@ -848,3 +994,10 @@ async def ask_stream(request: AskRequest) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+from app import tracing_config
+
+
+
+

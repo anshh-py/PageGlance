@@ -3,10 +3,15 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
 from app import page_indexing
 from app.documents import Document
 from app.embeddings import EmbeddingProviderError
+from app.models import Base
 from app.normalization import exact_text_hash
+from app.repository import DocumentRepository
 
 
 class FakeEmbeddingService:
@@ -125,3 +130,26 @@ def test_page_chunk_limit_skips_persistence(monkeypatch) -> None:
 
     assert result.indexed is False
     assert result.fallback_code == "page_chunk_limit_exceeded"
+
+
+def test_index_page_persists_webpage_contract_metadata(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr(page_indexing, "get_ingestion_session_factory", lambda: factory)
+    monkeypatch.setattr(
+        page_indexing, "get_ingestion_embedding_service", lambda: FakeEmbeddingService()
+    )
+
+    result = page_indexing.index_page_context(
+        {"title": "Example", "url": "https://example.test/doc", "text": "Webpage body."}
+    )
+
+    assert result.indexed is True
+    with factory() as session:
+        stored = DocumentRepository(session).get_by_id(result.document_id)
+    assert stored is not None
+    assert stored.document.source_type == "webpage"
+    assert stored.document.source_url == "https://example.test/doc"
+    assert stored.document.title == "Example"
+    assert stored.document.metadata["extraction_status"] == "complete"

@@ -1,7 +1,9 @@
 """Groq-backed answer generation for page questions."""
 
+import asyncio
 import json
 import os
+import threading
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from functools import lru_cache
@@ -13,6 +15,34 @@ from groq import AsyncGroq, Groq
 
 DEFAULT_MODEL = "openai/gpt-oss-20b"
 DEFAULT_TIMEOUT_SECONDS = 30.0
+DEFAULT_MAX_CONCURRENCY = 4
+_MAX_CONCURRENCY = 8
+# Bound simultaneous provider calls to protect the free/hosted LLM quota and
+# to keep memory/connection usage predictable. Synchronous provider calls run
+# in worker threads; streaming calls run in the event loop.
+_sync_semaphore = threading.BoundedSemaphore(DEFAULT_MAX_CONCURRENCY)
+_async_semaphore = asyncio.Semaphore(DEFAULT_MAX_CONCURRENCY)
+_llm_concurrency_configured = False
+
+
+def _concurrency_limit() -> int:
+    try:
+        value = int(os.getenv("PAGEGLANCE_LLM_MAX_CONCURRENCY", str(DEFAULT_MAX_CONCURRENCY)))
+    except ValueError:
+        value = DEFAULT_MAX_CONCURRENCY
+    if not 1 <= value <= _MAX_CONCURRENCY:
+        return DEFAULT_MAX_CONCURRENCY
+    return value
+
+
+def _configure_concurrency() -> None:
+    global _sync_semaphore, _async_semaphore, _llm_concurrency_configured
+    if _llm_concurrency_configured:
+        return
+    limit = _concurrency_limit()
+    _sync_semaphore = threading.BoundedSemaphore(limit)
+    _async_semaphore = asyncio.Semaphore(limit)
+    _llm_concurrency_configured = True
 DEFAULT_MAX_COMPLETION_TOKENS = 1024
 DEFAULT_CONTEXT_MAX_CHARS = 16_000
 MAX_CONTEXT_MAX_CHARS = 100_000
@@ -163,12 +193,14 @@ class GroqAnswerService:
     ) -> str:
         """Ask Groq for a concise answer grounded only in the provided page context."""
 
+        _configure_concurrency()
         messages = _build_messages(question, page_context, history or [], retrieved_sources)
-        completion = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            max_completion_tokens=self.max_completion_tokens,
-        )
+        with _sync_semaphore:
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                max_completion_tokens=self.max_completion_tokens,
+            )
 
         try:
             answer = completion.choices[0].message.content
@@ -196,6 +228,7 @@ async def stream_answer(
 ) -> AsyncIterator[str]:
     """Yield real text deltas from Groq and always close its stream and client."""
 
+    _configure_concurrency()
     client = AsyncGroq(
         api_key=settings.api_key,
         timeout=settings.timeout_seconds,
@@ -203,19 +236,20 @@ async def stream_answer(
     )
     stream = None
     try:
-        stream = await client.chat.completions.create(
-            model=settings.model,
-            messages=_build_messages(question, page_context, history or [], retrieved_sources),
-            max_completion_tokens=settings.max_completion_tokens,
-            stream=True,
-        )
+        async with _async_semaphore:
+            stream = await client.chat.completions.create(
+                model=settings.model,
+                messages=_build_messages(question, page_context, history or [], retrieved_sources),
+                max_completion_tokens=settings.max_completion_tokens,
+                stream=True,
+            )
 
-        async for chunk in stream:
-            if not chunk.choices:
-                continue
-            text = chunk.choices[0].delta.content
-            if isinstance(text, str) and text:
-                yield text
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                text = chunk.choices[0].delta.content
+                if isinstance(text, str) and text:
+                    yield text
     finally:
         try:
             if stream is not None:

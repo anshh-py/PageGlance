@@ -1,5 +1,6 @@
 """Coordinate scoped retrieval and grounded context preparation for chat routes."""
 
+import contextvars
 import hashlib
 import logging
 import re
@@ -15,6 +16,13 @@ from app.embeddings import EmbeddingError
 from app.retrieval import RetrievalError, RetrievedChunk, VectorRetriever
 
 logger = logging.getLogger(__name__)
+# Owner identity for the default retrieval path. Carried in a context variable so
+# the retrieve callable signature stays stable (test fixtures inject callables
+# that accept only the document/page scope), while production retrieval is still
+# forced to filter by the authenticated installation.
+_current_owner: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "pageglance_owner", default=None
+)
 _ADAPTIVE_TERMS = frozenset(
     "a an and are as at be by for from how i in is it of on or the this to was what when "
     "where which who why with".split()
@@ -44,8 +52,12 @@ def _retrieve_scoped_chunks(
     document_id: str | None,
     document_ids: list[str] | None,
     source_url: str | None,
+    source_type: str | None = None,
+    owner_id: str | None = None,
 ) -> list[RetrievedChunk]:
     """Open a request-scoped database session and retrieve within the active source."""
+    if owner_id is None:
+        owner_id = _current_owner.get()
     session_factory = create_session_factory()
     with session_factory() as session:
         retriever = VectorRetriever(session)
@@ -58,6 +70,8 @@ def _retrieve_scoped_chunks(
             scope["document_id"] = document_id
         if document_ids is not None:
             scope["document_ids"] = document_ids
+        if owner_id is not None:
+            scope["owner_id"] = owner_id
         return retriever.retrieve(question, **scope)
 
 
@@ -133,8 +147,10 @@ class RagOrchestrator:
         context_limit: int,
         document_id: str | None = None,
         document_ids: list[str] | None = None,
+        source_type: str | None = None,
         retrieval_enabled: bool = True,
         fallback_code: str | None = None,
+        owner_id: str | None = None,
     ) -> PreparedAnswerContext:
         """Retrieve only from the page/document scope and preserve the page fallback."""
         selected_page = select_page_context(question, page, context_limit)
@@ -149,108 +165,121 @@ class RagOrchestrator:
                 safe_scope,
             )
             return PreparedAnswerContext(selected_page, None, False, code)
+        scope: dict[str, object] = {
+            "document_id": document_id,
+            "document_ids": document_ids,
+            "source_type": source_type,
+            "source_url": None
+            if document_id is not None or document_ids is not None
+            else source_url,
+        }
+        token = _current_owner.set(owner_id)
         try:
-            scope: dict[str, object] = {
-                "document_id": document_id,
-                "document_ids": document_ids,
-                "source_url": None
-                if document_id is not None or document_ids is not None
-                else source_url,
-            }
-            chunks = self.retrieve(question, **scope)
-        except (
-            DatabaseConfigurationError,
-            EmbeddingError,
-            RetrievalError,
-            SQLAlchemyError,
-        ) as error:
-            # Do not expose database/provider exception details in fallback logs or responses.
-            code = getattr(error, "code", "retrieval_unavailable")
-            logger.info(
-                "rag_fallback code=%s page_text_chars=%d scope=%s results=0",
-                code,
-                len(page.get("text", "")),
-                safe_scope,
-            )
-            return PreparedAnswerContext(selected_page, None, False, code)
-
-        if not chunks:
-            adaptive_queries = _adaptive_queries(question, page)
-            retry_results: list[list[RetrievedChunk]] = []
-            if adaptive_queries:
-                try:
-                    retry_results = [self.retrieve(query, **scope) for query in adaptive_queries]
-                    chunks = _merge_retry_results(retry_results)
-                    logger.info(
-                        "rag_adaptive_retry queries=%d results=%d",
-                        len(adaptive_queries),
-                        len(chunks),
-                    )
-                except (
-                    DatabaseConfigurationError,
-                    EmbeddingError,
-                    RetrievalError,
-                    SQLAlchemyError,
-                ):
-                    logger.info("rag_adaptive_retry_failed code=retry_unavailable")
-            if not chunks:
+            try:
+                chunks = self.retrieve(question, **scope)
+            except (
+                DatabaseConfigurationError,
+                EmbeddingError,
+                RetrievalError,
+                SQLAlchemyError,
+            ) as error:
+                # Do not expose database/provider exception details in fallback logs or responses.
+                code = getattr(error, "code", "retrieval_unavailable")
                 logger.info(
-                    "rag_fallback code=no_indexed_content page_text_chars=%d scope=%s results=0",
+                    "rag_fallback code=%s page_text_chars=%d scope=%s results=0",
+                    code,
                     len(page.get("text", "")),
                     safe_scope,
                 )
-                return PreparedAnswerContext(selected_page, None, False, "no_indexed_content")
-        else:
-            adaptive_queries = _adaptive_queries(question, page)
-            covered = _covered_query_queries(adaptive_queries, chunks)
-            missing = [query for query in adaptive_queries if query not in covered]
-            if missing:
-                try:
-                    retry_results = [self.retrieve(query, **scope) for query in missing]
-                    chunks = _merge_retry_results([chunks, *retry_results])
-                    logger.info(
-                        "rag_adaptive_retry queries=%d results=%d", len(missing), len(chunks)
-                    )
-                except (
-                    DatabaseConfigurationError,
-                    EmbeddingError,
-                    RetrievalError,
-                    SQLAlchemyError,
-                ):
-                    logger.info("rag_adaptive_retry_failed code=retry_unavailable")
+                return PreparedAnswerContext(selected_page, None, False, code)
 
-        sources = [
-            {
-                "id": f"S{index}",
-                "chunk_id": chunk.chunk_id,
-                "document_id": chunk.document_id,
-                "chunk_index": chunk.chunk_index,
-                "title": chunk.title,
-                "source_type": chunk.source_type,
-                "source_url": chunk.source_url,
-                "filename": chunk.filename,
-                "similarity": chunk.similarity,
-                "text": chunk.text,
-                "chunk_metadata": chunk.chunk_metadata,
-            }
-            for index, chunk in enumerate(chunks, start=1)
-        ]
-        logger.info(
-            "rag_retrieval_used scope=%s results=%d retrieved=%s page_text_chars=%d",
-            safe_scope,
-            len(sources),
-            [
+            if not chunks:
+                adaptive_queries = _adaptive_queries(question, page)
+                retry_results: list[list[RetrievedChunk]] = []
+                if adaptive_queries:
+                    try:
+                        retry_results = [
+                            self.retrieve(query, **scope) for query in adaptive_queries
+                        ]
+                        chunks = _merge_retry_results(retry_results)
+                        logger.info(
+                            "rag_adaptive_retry queries=%d results=%d",
+                            len(adaptive_queries),
+                            len(chunks),
+                        )
+                    except (
+                        DatabaseConfigurationError,
+                        EmbeddingError,
+                        RetrievalError,
+                        SQLAlchemyError,
+                    ):
+                        logger.info("rag_adaptive_retry_failed code=retry_unavailable")
+                if not chunks:
+                    logger.info(
+                        "rag_fallback code=no_indexed_content page_text_chars=%d scope=%s results=0",
+                        len(page.get("text", "")),
+                        safe_scope,
+                    )
+                    return PreparedAnswerContext(
+                        selected_page, None, False, "no_indexed_content"
+                    )
+            else:
+                adaptive_queries = _adaptive_queries(question, page)
+                covered = _covered_query_queries(adaptive_queries, chunks)
+                missing = [query for query in adaptive_queries if query not in covered]
+                if missing:
+                    try:
+                        retry_results = [
+                            self.retrieve(query, **scope) for query in missing
+                        ]
+                        chunks = _merge_retry_results([chunks, *retry_results])
+                        logger.info(
+                            "rag_adaptive_retry queries=%d results=%d",
+                            len(missing),
+                            len(chunks),
+                        )
+                    except (
+                        DatabaseConfigurationError,
+                        EmbeddingError,
+                        RetrievalError,
+                        SQLAlchemyError,
+                    ):
+                        logger.info("rag_adaptive_retry_failed code=retry_unavailable")
+
+            sources = [
                 {
-                    "rank": rank,
-                    "chunk_id": source["chunk_id"],
-                    "source_id": source["id"],
-                    "similarity": source["similarity"],
+                    "id": f"S{index}",
+                    "chunk_id": chunk.chunk_id,
+                    "document_id": chunk.document_id,
+                    "chunk_index": chunk.chunk_index,
+                    "title": chunk.title,
+                    "source_type": chunk.source_type,
+                    "source_url": chunk.source_url,
+                    "filename": chunk.filename,
+                    "similarity": chunk.similarity,
+                    "text": chunk.text,
+                    "chunk_metadata": chunk.chunk_metadata,
                 }
-                for rank, source in enumerate(sources, start=1)
-            ],
-            len(page.get("text", "")),
-        )
-        return PreparedAnswerContext(selected_page, sources, True)
+                for index, chunk in enumerate(chunks, start=1)
+            ]
+            logger.info(
+                "rag_retrieval_used scope=%s results=%d retrieved=%s page_text_chars=%d",
+                safe_scope,
+                len(sources),
+                [
+                    {
+                        "rank": rank,
+                        "chunk_id": source["chunk_id"],
+                        "source_id": source["id"],
+                        "similarity": source["similarity"],
+                    }
+                    for rank, source in enumerate(sources, start=1)
+                ],
+                len(page.get("text", "")),
+            )
+            return PreparedAnswerContext(selected_page, sources, True)
+        finally:
+            _current_owner.reset(token)
 
 
 rag_orchestrator = RagOrchestrator()

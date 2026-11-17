@@ -90,10 +90,36 @@ export function removeUploadedDocument(
   return documents.filter((document) => document.document_id !== documentId)
 }
 
+export async function deleteDocument(
+  documentId: string,
+  apiUrl: string,
+  fetcher: typeof fetch = fetch,
+  authorization?: string,
+): Promise<void> {
+  let response: Response
+  try {
+    const init: RequestInit = { method: 'DELETE' }
+    if (authorization) init.headers = { Authorization: `Bearer ${authorization}` }
+    response = await fetcher(`${apiUrl.replace(/\/$/, '')}/documents/${documentId}`, init)
+  } catch {
+    throw new Error('Could not reach the PageGlance API. Check that the backend is running.')
+  }
+  if (response.status === 204) return
+  let payload: unknown
+  try {
+    payload = await response.json()
+  } catch {
+    payload = null
+  }
+  const detail = isRecord(payload) && typeof payload.detail === 'string' ? payload.detail : ''
+  throw new Error(detail || `Delete failed with status ${response.status}.`)
+}
+
 export async function uploadDocument(
   file: File,
   apiUrl: string,
   fetcher: typeof fetch = fetch,
+  authorization?: string,
 ): Promise<Omit<UploadedDocument, 'uploaded_at'>> {
   const extension = file.name.split('.').at(-1)?.toLowerCase()
   if (extension !== 'txt' && extension !== 'pdf') {
@@ -105,10 +131,9 @@ export async function uploadDocument(
   body.append('file', file, file.name)
   let response: Response
   try {
-    response = await fetcher(`${apiUrl.replace(/\/$/, '')}/documents/upload`, {
-      method: 'POST',
-      body,
-    })
+    const init: RequestInit = { method: 'POST', body }
+    if (authorization) init.headers = { Authorization: `Bearer ${authorization}` }
+    response = await fetcher(`${apiUrl.replace(/\/$/, '')}/documents/upload`, init)
   } catch {
     throw new Error('Could not reach the PageGlance API. Check that the backend is running.')
   }
@@ -153,13 +178,26 @@ export function citationLabel(source: AnswerSource): string {
   return `${name}${pageLabel}`
 }
 
+/** Only allow safe http/https URLs to become clickable links. */
+export function safeCitationHref(value: string | null | undefined): string | null {
+  if (!value) return null
+  let parsed: URL
+  try {
+    parsed = new URL(value)
+  } catch {
+    return null
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+  return value
+}
+
 export function citationItems(sources: AnswerSource[]) {
   return sources.map((source) => ({
     key: `${source.document_id}:${source.id}`,
     id: source.id,
     documentId: source.document_id,
     label: citationLabel(source),
-    href: source.source_url || null,
+    href: safeCitationHref(source.source_url),
     snippet: source.snippet || null,
   }))
 }
@@ -177,6 +215,101 @@ export function createScopedAskRequest(
   if (document) return { question, document_id: document.document_id, history }
   if (!page) throw new Error('A webpage or uploaded document must be selected.')
   return { question, page, history }
+}
+
+export interface UrlImportResult {
+  document_id: string
+  chunk_count: number
+  title: string
+  source_url: string
+  indexed: boolean
+  fallback_code: string | null
+}
+
+/**
+ * UX-only URL gate for the URL-import recovery action. This is a convenience
+ * check for a readable error message — it is NOT a security boundary. The
+ * backend `/ingest/url` endpoint remains the authoritative validator (scheme
+ * allowlist, SSRF/public-resolution checks, redirect defense, size caps, and
+ * credential rejection).
+ */
+export function assertImportableUrl(value: string): string {
+  const trimmed = value.trim()
+  if (!trimmed) throw new Error('Enter a URL to import.')
+  let parsed: URL
+  try {
+    parsed = new URL(trimmed)
+  } catch {
+    throw new Error('That is not a valid URL.')
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('Only web addresses (http/https) can be imported.')
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error('The URL must not contain embedded credentials.')
+  }
+  return trimmed
+}
+
+export async function importUrlDocument(
+  url: string,
+  apiUrl: string,
+  fetcher: typeof fetch = fetch,
+  authorization?: string,
+): Promise<UrlImportResult> {
+  const target = assertImportableUrl(url)
+  let response: Response
+  try {
+    const init: RequestInit = {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: target }),
+    }
+    if (authorization) {
+      init.headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${authorization}` }
+    }
+    response = await fetcher(`${apiUrl.replace(/\/$/, '')}/ingest/url`, init)
+  } catch {
+    throw new Error('Could not reach the PageGlance API. Check that the backend is running.')
+  }
+
+  let payload: unknown
+  try {
+    payload = await response.json()
+  } catch {
+    throw new Error(`The backend returned an unreadable response (${response.status}).`)
+  }
+  if (!response.ok) {
+    const detail = isRecord(payload) && typeof payload.detail === 'string' ? payload.detail : ''
+    throw new Error(detail || `URL import failed with status ${response.status}.`)
+  }
+  if (!isRecord(payload)) {
+    throw new Error('The backend returned invalid import information.')
+  }
+  const documentId = payload.document_id
+  const chunkCount = payload.chunk_count
+  const title = payload.title
+  const sourceUrl = payload.source_url
+  const indexed = payload.indexed
+  if (
+    typeof documentId !== 'string' ||
+    typeof chunkCount !== 'number' || !Number.isInteger(chunkCount) ||
+    typeof title !== 'string' ||
+    typeof sourceUrl !== 'string' ||
+    typeof indexed !== 'boolean'
+  ) {
+    throw new Error('The backend returned invalid import information.')
+  }
+  const fallbackCode = payload.fallback_code
+  const result: UrlImportResult = {
+    document_id: documentId,
+    chunk_count: chunkCount,
+    title,
+    source_url: sourceUrl,
+    indexed,
+    fallback_code: typeof fallbackCode === 'string' ? fallbackCode : null,
+  }
+  return result
 }
 
 export interface DocumentConversation {

@@ -2,6 +2,7 @@ import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.tsx'
+import { browser } from './browser'
 
 export type ThemePreference = 'system' | 'light' | 'dark'
 
@@ -15,11 +16,9 @@ async function mountApp() {
   let theme: ThemePreference = 'system'
 
   try {
-    if (typeof chrome !== 'undefined' && chrome.storage?.local) {
-      const stored = await chrome.storage.local.get(THEME_STORAGE_KEY)
-      if (isThemePreference(stored[THEME_STORAGE_KEY])) {
-        theme = stored[THEME_STORAGE_KEY]
-      }
+    const stored = await browser.storage.local.get(THEME_STORAGE_KEY)
+    if (isThemePreference(stored[THEME_STORAGE_KEY])) {
+      theme = stored[THEME_STORAGE_KEY]
     }
   } catch {
     // Keep the system theme when extension storage is unavailable.

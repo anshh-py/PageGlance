@@ -33,7 +33,8 @@ class DocumentRecord(Base):
     __tablename__ = "documents"
     __table_args__ = (
         Index(
-            "uq_documents_non_webpage_content_hash",
+            "uq_documents_owner_content_hash",
+            "owner_id",
             "content_hash",
             unique=True,
             postgresql_where=text("source_type <> 'webpage'"),
@@ -42,6 +43,9 @@ class DocumentRecord(Base):
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    # Installation-level owner for the document. NULL = legacy/ownerless record
+    # that predates auth and is never reachable through authenticated routes.
+    owner_id: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
     source_type: Mapped[str] = mapped_column(String(32), nullable=False)
     title: Mapped[str] = mapped_column(String(1000), default="", nullable=False)
     source_url: Mapped[str | None] = mapped_column(Text)
@@ -64,6 +68,40 @@ class DocumentRecord(Base):
         order_by="DocumentChunkRecord.index",
         passive_deletes=True,
     )
+
+
+class InstallationRecord(Base):
+    """An authenticated browser installation and its token hash (never the token)."""
+
+    __tablename__ = "installations"
+    __table_args__ = (Index("ix_installations_token_hash", "token_hash"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(80), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class RateLimitCounter(Base):
+    """Fixed-window rate-limit counter shared across workers."""
+
+    __tablename__ = "rate_limit_counters"
+    __table_args__ = (
+        Index(
+            "uq_rate_limit_action_key_window",
+            "action",
+            "key",
+            "window_start",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    key: Mapped[str] = mapped_column(String(128), nullable=False)
+    window_start: Mapped[int] = mapped_column(Integer, nullable=False)
+    count: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
 class DocumentChunkRecord(Base):

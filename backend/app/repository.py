@@ -179,6 +179,7 @@ class DocumentRepository:
         embedding_model: str | None = None,
         embedding_dimensions: int | None = None,
         storage_profile: str = "legacy",
+        owner_id: str | None = None,
     ) -> Document:
         """Save a document and its chunks, returning the canonical copy on duplicates.
 
@@ -204,6 +205,10 @@ class DocumentRepository:
             DocumentRecord.content_hash == result.document.content_hash,
             DocumentRecord.source_type != "webpage",
         )
+        if owner_id is not None:
+            duplicate_query = duplicate_query.where(DocumentRecord.owner_id == owner_id)
+        else:
+            duplicate_query = duplicate_query.where(DocumentRecord.owner_id.is_(None))
         duplicate = (
             None
             if result.document.source_type == "webpage"
@@ -237,7 +242,7 @@ class DocumentRepository:
             return _to_document(record)
 
         if record is None:
-            record = DocumentRecord(id=result.document.id)
+            record = DocumentRecord(id=result.document.id, owner_id=owner_id)
             self.session.add(record)
         else:
             self.session.execute(
@@ -348,10 +353,19 @@ class DocumentRepository:
             if exact_text_hash(chunk.text) in vectors_by_hash
         }
 
-    def get_by_id(self, document_id: str) -> IngestionResult | None:
-        """Return a document and its chunks ordered by chunk index, or None."""
+    def get_by_id(
+        self, document_id: str, *, owner_id: str | None = None
+    ) -> IngestionResult | None:
+        """Return a document and its chunks ordered by chunk index, or None.
+
+        When ``owner_id`` is supplied, the record must belong to that owner
+        (legacy ownerless records are never returned), enforcing cross-owner
+        isolation at the repository boundary.
+        """
         record = self.session.get(DocumentRecord, document_id)
         if record is None:
+            return None
+        if owner_id is not None and record.owner_id != owner_id:
             return None
         chunk_records = self.session.scalars(
             select(DocumentChunkRecord)
@@ -362,3 +376,21 @@ class DocumentRepository:
             document=_to_document(record),
             chunks=[_to_chunk(chunk) for chunk in chunk_records],
         )
+
+    def delete_by_id(self, document_id: str, *, owner_id: str) -> bool:
+        """Delete a document and all its chunks/vectors iff it belongs to owner_id.
+
+        Returns True when a document was deleted; False when the document does not
+        exist or is not owned by ``owner_id`` (the caller maps this to 404). The
+        chunk rows (and their embedding/vector columns) are removed first, then the
+        document row, within a single transaction.
+        """
+        record = self.session.get(DocumentRecord, document_id)
+        if record is None or record.owner_id != owner_id:
+            return False
+        self.session.execute(
+            delete(DocumentChunkRecord).where(DocumentChunkRecord.document_id == document_id)
+        )
+        self.session.delete(record)
+        self.session.commit()
+        return True

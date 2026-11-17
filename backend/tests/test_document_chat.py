@@ -52,7 +52,7 @@ def configure_document(monkeypatch, document: IngestionResult) -> None:
         def __init__(self, _session):
             pass
 
-        def get_by_id(self, document_id):
+        def get_by_id(self, document_id, *, owner_id=None):
             return document if document.document.id == document_id else None
 
     monkeypatch.setattr(main, "DocumentRepository", FakeRepository)
@@ -76,7 +76,7 @@ def test_document_ask_uses_exact_validated_scope_and_returns_page_citation(monke
     }
 
     class FakeRag:
-        def prepare(self, question, page, *, context_limit, document_id, retrieval_enabled):
+        def prepare(self, question, page, *, context_limit, document_id, retrieval_enabled, owner_id=None):
             retrieval_calls.append((question, page, document_id, retrieval_enabled))
             return PreparedAnswerContext(page, [citation], True)
 
@@ -257,9 +257,12 @@ def test_unique_fact_upload_extraction_retrieval_and_grounding(monkeypatch, capl
         def embed_texts(texts):
             return [[1.0, 0.0, 0.0] for _ in texts]
 
+    from app import page_indexing
+
     monkeypatch.setattr(document_ingestion, "get_ingestion_session_factory", lambda: factory)
+    monkeypatch.setattr(page_indexing, "get_ingestion_session_factory", lambda: factory)
     monkeypatch.setattr(
-        document_ingestion,
+        page_indexing,
         "get_ingestion_embedding_service",
         lambda: FakeEmbeddingService(),
     )
@@ -272,7 +275,14 @@ def test_unique_fact_upload_extraction_retrieval_and_grounding(monkeypatch, capl
     document_id = upload.json()["document_id"]
     scopes = []
 
-    def retrieve(_question, *, document_id, document_ids, source_url):
+    def retrieve(
+    _question,
+    *,
+    document_id,
+    document_ids,
+    source_url,
+    source_type=None,
+):
         scopes.append((document_id, document_ids, source_url))
         if document_ids is not None or source_url is not None:
             return []
@@ -443,7 +453,7 @@ def test_multi_document_chat_validates_and_preserves_explicit_scope(monkeypatch)
         def __init__(self, _session):
             pass
 
-        def get_by_id(self, document_id):
+        def get_by_id(self, document_id, *, owner_id=None):
             return documents.get(document_id)
 
     monkeypatch.setattr(main, "DocumentRepository", FakeRepository)
@@ -463,7 +473,7 @@ def test_multi_document_chat_validates_and_preserves_explicit_scope(monkeypatch)
     ]
 
     class FakeRag:
-        def prepare(self, _question, page, *, context_limit, document_ids, retrieval_enabled):
+        def prepare(self, _question, page, *, context_limit, document_ids, retrieval_enabled, owner_id=None):
             captured.update(
                 page=page,
                 context_limit=context_limit,
@@ -499,7 +509,7 @@ def test_multi_document_chat_rejects_invalid_or_unselected_source(monkeypatch) -
         def __init__(self, _session):
             pass
 
-        def get_by_id(self, document_id):
+        def get_by_id(self, document_id, *, owner_id=None):
             return documents.get(document_id)
 
     class CrossScopeRag:

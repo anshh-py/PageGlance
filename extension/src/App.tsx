@@ -3,7 +3,10 @@ import type { ThemePreference } from './main'
 import { consumeAnswerStream, parseAskResponse } from './api'
 import {
   addUploadedDocument,
+  assertImportableUrl,
   createScopedAskRequest,
+  deleteDocument,
+  importUrlDocument,
   removeUploadedDocument,
   uploadStateReducer,
   uploadDocument,
@@ -35,9 +38,18 @@ import { clearConversationStore, loadConversationStore, saveConversationStore } 
 import { AnswerWithSources } from './SourceCitations'
 import { MarkdownAnswer } from './MarkdownAnswer'
 import { EXTRACT_PAGE_MESSAGE, type AskRequest, type ExtractPageResponse, type PageContext } from './messages'
+import { browser } from './browser'
+import { API_BASE_URL } from './config'
+import { ensureInstallation } from './auth'
+import { isRestrictedPageUrl, RESTRICTED_PAGE_MESSAGE } from './pageSupport'
+import {
+  classifyExtractionFailure,
+  decideFallbackAction,
+  ExtractionFailureCategory,
+  FallbackAction,
+  type ExtractionAttemptDescriptor,
+} from './extractionRecovery'
 import './App.css'
-
-const API_URL = (import.meta.env.VITE_PAGEGLANCE_API_URL || 'http://127.0.0.1:8000').replace(/\/$/, '')
 const THEME_ORDER: ThemePreference[] = ['system', 'light', 'dark']
 const STORAGE_DEBOUNCE_MS = 250
 const HISTORY_MAX_MESSAGES = 20
@@ -60,21 +72,82 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Something went wrong. Please try again.'
 }
 
-async function extractPage(tabId: number): Promise<PageContext> {
+interface ExtractionFailureInfo {
+  category: ExtractionFailureCategory
+  action: FallbackAction
+  message: string
+}
+
+type ExtractOutcome =
+  | { ok: true; page: PageContext }
+  | { ok: false; failure: ExtractionFailureInfo }
+
+/**
+ * One active-tab extraction attempt, returning a structured outcome instead of
+ * throwing. Empty content is detected explicitly (it must not be misread as a
+ * restricted page); every other failure is classified with the M7.1 classifier
+ * and mapped to its permitted fallback action.
+ */
+async function performExtraction(tabId: number): Promise<ExtractOutcome> {
   try {
-    await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] })
-    const result = await chrome.tabs.sendMessage<ExtractPageResponse>(tabId, {
+    await browser.scripting.executeScript({ target: { tabId }, files: ['content.js'] })
+    const result = await browser.tabs.sendMessage<ExtractPageResponse>(tabId, {
       type: EXTRACT_PAGE_MESSAGE,
     })
     if (!result.ok) throw new Error(result.error)
-    if (!result.page.text) throw new Error('No readable page text was found on this tab.')
-    return result.page
-  } catch (error) {
-    throw new Error(
-      `PageGlance cannot read this tab. Chrome restricts extensions on internal pages and the Chrome Web Store. (${getErrorMessage(error)})`,
-      { cause: error },
-    )
+    if (!result.page.text) {
+      return {
+        ok: false,
+        failure: {
+          category: ExtractionFailureCategory.EMPTY_CONTENT,
+          action: decideFallbackAction(ExtractionFailureCategory.EMPTY_CONTENT),
+          message: 'No readable page text was found on this tab.',
+        },
+      }
+    }
+    return { ok: true, page: result.page }
+  } catch (caught) {
+    const descriptor: ExtractionAttemptDescriptor = { error: caught }
+    const category = classifyExtractionFailure(descriptor)
+    const action = decideFallbackAction(category)
+    const message =
+      category === ExtractionFailureCategory.RESTRICTED_PAGE
+        ? RESTRICTED_PAGE_MESSAGE
+        : getErrorMessage(caught)
+    return { ok: false, failure: { category, action, message } }
   }
+}
+
+/**
+ * Extract from the active tab with at most one automatic retry for transient
+ * failures (those mapped by the decision logic to RETRY_ACTIVE_TAB_EXTRACTION).
+ * Before retrying, the active tab is rechecked against the original tab so we
+ * never retry a tab that changed. Restricted/access-denied/empty/navigation/
+ * invalid-response failures, and backend ingestion failures, are never retried
+ * as extraction failures. Duplicate extraction is prevented by capping retries
+ * at one.
+ */
+async function extractWithRecovery(tabId: number): Promise<ExtractOutcome> {
+  const first = await performExtraction(tabId)
+  if (first.ok || first.failure.action !== FallbackAction.RETRY_ACTIVE_TAB_EXTRACTION) {
+    return first
+  }
+  try {
+    const activeTab = (await browser.tabs.query({ active: true, currentWindow: true }))[0]
+    if (activeTab?.id !== tabId) {
+      return {
+        ok: false,
+        failure: {
+          category: ExtractionFailureCategory.NAVIGATION_OR_TAB_CHANGED,
+          action: FallbackAction.STOP,
+          message: 'The active tab changed while extracting. Reopen PageGlance on the correct page.',
+        },
+      }
+    }
+  } catch {
+    return first
+  }
+  return performExtraction(tabId)
 }
 
 function updateMessage(
@@ -99,10 +172,13 @@ function App({ initialTheme, fullPage = false }: AppProps) {
   const [pageTitle, setPageTitle] = useState('')
   const [pageStatus, setPageStatus] = useState<PageStatus>('loading')
   const [pageError, setPageError] = useState('')
+  const [extractionFailure, setExtractionFailure] = useState<ExtractionFailureInfo | null>(null)
   const [uploadedDocuments, setUploadedDocuments] = useState<UploadedDocument[]>([])
   const [selectedDocument, setSelectedDocument] = useState<UploadedDocument | null>(null)
   const [sourceMenuOpen, setSourceMenuOpen] = useState(false)
   const [uploadState, dispatchUpload] = useReducer(uploadStateReducer, { status: 'idle' })
+  const [urlImportState, dispatchUrlImport] = useReducer(uploadStateReducer, { status: 'idle' })
+  const [urlImportDraft, setUrlImportDraft] = useState('')
   const [restoreReady, setRestoreReady] = useState(false)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
@@ -115,13 +191,29 @@ function App({ initialTheme, fullPage = false }: AppProps) {
   const pageTitleRef = useRef('')
   const pageContextRef = useRef<PageContext | null>(null)
   const selectedDocumentRef = useRef<UploadedDocument | null>(null)
+  const importedDocumentRef = useRef<{ document_id: string; title: string } | null>(null)
   const sourceSelectorButtonRef = useRef<HTMLButtonElement>(null)
   const documentFileInputRef = useRef<HTMLInputElement>(null)
   const controllerRef = useRef<AbortController | null>(null)
   const requestInFlightRef = useRef(false)
+  const questionInputRef = useRef<HTMLTextAreaElement>(null)
+  const wasLoadingRef = useRef(false)
   const mountedRef = useRef(false)
   const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const persistQueueRef = useRef<Promise<void>>(Promise.resolve())
+
+  // Restore keyboard focus to the composer after each answer finishes or fails.
+  // This works for both webpage chat and PDF/document chat because they share this composer.
+  useEffect(() => {
+    if (loading) {
+      wasLoadingRef.current = true
+      return
+    }
+    if (wasLoadingRef.current) {
+      wasLoadingRef.current = false
+      if (restoreReady) requestAnimationFrame(() => questionInputRef.current?.focus())
+    }
+  }, [loading, restoreReady])
 
   const queueSave = useCallback(() => {
     const documentSnapshot = JSON.parse(JSON.stringify(documentConversationsRef.current)) as Record<string, DocumentConversation>
@@ -207,8 +299,8 @@ function App({ initialTheme, fullPage = false }: AppProps) {
       try {
         const sourceTabId = fullPage ? Number(new URLSearchParams(location.search).get('sourceTabId')) : NaN
         const tab = Number.isInteger(sourceTabId) && sourceTabId > 0
-          ? await chrome.tabs.get(sourceTabId)
-          : (await chrome.tabs.query({ active: true, currentWindow: true }))[0]
+          ? await browser.tabs.get(sourceTabId)
+          : (await browser.tabs.query({ active: true, currentWindow: true }))[0]
         if (!active) return
         const initialUrl = normalizePageUrl(tab?.url ?? '')
         pageUrlRef.current = initialUrl
@@ -238,9 +330,27 @@ function App({ initialTheme, fullPage = false }: AppProps) {
           : null
         if (requestedDocument) activateDocument(requestedDocument)
         if (tab?.id === undefined || !initialUrl) throw new Error('PageGlance could not identify the active webpage.')
+        if (isRestrictedPageUrl(initialUrl)) {
+          setPageStatus('unsupported')
+          setPageError(RESTRICTED_PAGE_MESSAGE)
+          setRestoreReady(true)
+          return
+        }
         setPageStatus('loading')
-        const extracted = await extractPage(tab.id)
+        const outcome = await extractWithRecovery(tab.id)
         if (!active) return
+        if (!outcome.ok) {
+          setPageStatus('unsupported')
+          setPageError(outcome.failure.message)
+          setExtractionFailure(outcome.failure)
+          if (outcome.failure.action === FallbackAction.OFFER_URL_IMPORT) {
+            setUrlImportDraft((current) => current || pageUrlRef.current || '')
+          }
+          setRestoreReady(true)
+          return
+        }
+        const extracted = outcome.page
+        setExtractionFailure(null)
         pageContextRef.current = extracted
         setPageTitle(extracted.title)
         pageTitleRef.current = extracted.title
@@ -295,7 +405,7 @@ function App({ initialTheme, fullPage = false }: AppProps) {
     const nextTheme = THEME_ORDER[(THEME_ORDER.indexOf(theme) + 1) % THEME_ORDER.length]
     setTheme(nextTheme)
     document.documentElement.dataset.theme = nextTheme
-    void chrome.storage.local.set({ pageGlanceTheme: nextTheme }).catch(() => {
+    void browser.storage.local.set({ pageGlanceTheme: nextTheme }).catch(() => {
       setError('Could not save the theme preference.')
     })
   }
@@ -321,8 +431,8 @@ function App({ initialTheme, fullPage = false }: AppProps) {
     if (documentId && !document) return
     activateDocument(document)
     try {
-      if (document) await chrome.storage.local.set({ [SELECTED_DOCUMENT_KEY]: document.document_id })
-      else await chrome.storage.local.remove(SELECTED_DOCUMENT_KEY)
+      if (document) await browser.storage.local.set({ [SELECTED_DOCUMENT_KEY]: document.document_id })
+      else await browser.storage.local.remove(SELECTED_DOCUMENT_KEY)
     } catch {
       setError('Could not save the selected chat context to extension storage.')
     }
@@ -330,19 +440,25 @@ function App({ initialTheme, fullPage = false }: AppProps) {
 
   async function handleRemoveDocument(documentId: string) {
     if (loading || requestInFlightRef.current) return
+    const currentlySelected = selectedDocumentRef.current?.document_id === documentId
+    try {
+      const token = await ensureInstallation({ apiUrl: API_BASE_URL })
+      await deleteDocument(documentId, API_BASE_URL, fetch, token)
+    } catch (caught) {
+      setError(getErrorMessage(caught) || 'Could not remove this document from the backend.')
+      return
+    }
     const nextDocuments = removeUploadedDocument(uploadedDocumentsRef.current, documentId)
-    if (nextDocuments.length === uploadedDocumentsRef.current.length) return
-    const removingSelectedDocument = selectedDocumentRef.current?.document_id === documentId
     try {
       await saveUploadedDocuments(nextDocuments)
-      if (removingSelectedDocument) await chrome.storage.local.remove(SELECTED_DOCUMENT_KEY)
+      if (currentlySelected) await browser.storage.local.remove(SELECTED_DOCUMENT_KEY)
       uploadedDocumentsRef.current = nextDocuments
       setUploadedDocuments(nextDocuments)
-      if (removingSelectedDocument) activateDocument(null)
+      if (currentlySelected) activateDocument(null)
       setSourceMenuOpen(false)
       setError('')
     } catch {
-      setError('Could not remove this document from the extension library.')
+      setError('The document was deleted, but its entry could not be cleared from the extension library.')
     }
   }
 
@@ -350,7 +466,8 @@ function App({ initialTheme, fullPage = false }: AppProps) {
     if (uploadState.status === 'uploading') return
     dispatchUpload({ type: 'start', filename: file.name })
     try {
-      const response = await uploadDocument(file, API_URL)
+      const token = await ensureInstallation({ apiUrl: API_BASE_URL })
+      const response = await uploadDocument(file, API_BASE_URL, fetch, token)
       if (persistTimerRef.current) {
         clearTimeout(persistTimerRef.current)
         persistTimerRef.current = null
@@ -368,7 +485,9 @@ function App({ initialTheme, fullPage = false }: AppProps) {
       uploadedDocumentsRef.current = nextDocuments
       setUploadedDocuments(nextDocuments)
       activateDocument(uploaded)
-      await chrome.storage.local.set({ [SELECTED_DOCUMENT_KEY]: uploaded.document_id })
+      setExtractionFailure(null)
+      setPageStatus('ready')
+      await browser.storage.local.set({ [SELECTED_DOCUMENT_KEY]: uploaded.document_id })
       dispatchUpload({
         type: 'success',
         message: `${uploaded.filename} ${uploaded.duplicate ? 'is already available' : 'uploaded'} · ${uploaded.chunk_count} chunks${uploaded.page_count ? ` · ${uploaded.page_count} pages` : ''}.`,
@@ -378,12 +497,85 @@ function App({ initialTheme, fullPage = false }: AppProps) {
     }
   }
 
+  async function handleImportUrl() {
+    if (urlImportState.status === 'uploading') return
+    const url = urlImportDraft.trim()
+    try {
+      assertImportableUrl(url)
+    } catch (caught) {
+      dispatchUrlImport({ type: 'error', message: getErrorMessage(caught) })
+      return
+    }
+    dispatchUrlImport({ type: 'start', filename: 'URL' })
+    try {
+      const token = await ensureInstallation({ apiUrl: API_BASE_URL })
+      const result = await importUrlDocument(url, API_BASE_URL, fetch, token)
+      if (!result.indexed) {
+        dispatchUrlImport({
+          type: 'error',
+          message:
+            result.fallback_code === 'empty_page_text'
+              ? 'That page has no readable text, so nothing was indexed.'
+              : 'That page could not be indexed by the backend.',
+        })
+        return
+      }
+      dispatchUrlImport({
+        type: 'success',
+        message: `Indexed “${result.title}” · ${result.chunk_count} chunks.`,
+      })
+      importedDocumentRef.current = { document_id: result.document_id, title: result.title }
+      setExtractionFailure(null)
+      setPageStatus('ready')
+    } catch (caught) {
+      dispatchUrlImport({ type: 'error', message: getErrorMessage(caught) })
+    }
+  }
+
+  async function handleReextract() {
+    if (loading || requestInFlightRef.current || pageStatus === 'loading' || uploadState.status === 'uploading' || urlImportState.status === 'uploading') return
+    if (selectedDocument) return
+    try {
+      const sourceTabId = fullPage ? Number(new URLSearchParams(location.search).get('sourceTabId')) : NaN
+      const tab = Number.isInteger(sourceTabId) && sourceTabId > 0
+        ? await browser.tabs.get(sourceTabId)
+        : (await browser.tabs.query({ active: true, currentWindow: true }))[0]
+      if (tab?.id === undefined) throw new Error('Could not find the active tab.')
+      setPageStatus('loading')
+      const outcome = await extractWithRecovery(tab.id)
+      if (!outcome.ok) {
+        setPageStatus('unsupported')
+        setPageError(outcome.failure.message)
+        setExtractionFailure(outcome.failure)
+        if (outcome.failure.action === FallbackAction.OFFER_URL_IMPORT) {
+          setUrlImportDraft((current) => current || pageUrlRef.current || '')
+        }
+        return
+      }
+      const extracted = outcome.page
+      setExtractionFailure(null)
+      pageContextRef.current = extracted
+      setPageTitle(extracted.title)
+      pageTitleRef.current = extracted.title
+      const extractedUrl = normalizePageUrl(extracted.url)
+      if (extractedUrl) {
+        pageUrlRef.current = extractedUrl
+        setPageUrl(extractedUrl)
+      }
+      setPageStatus('ready')
+    } catch (caught) {
+      setPageStatus('unsupported')
+      setPageError(getErrorMessage(caught))
+    }
+  }
+
   async function submitQuestion(rawQuestion: string) {
     const trimmedQuestion = rawQuestion.trim()
     if (!trimmedQuestion || requestInFlightRef.current) return
     const activeDocument = selectedDocumentRef.current
-    if (activeDocument ? !activeDocument.document_id : (pageStatus !== 'ready' || !pageUrlRef.current)) {
-      setError(activeDocument ? 'Select a valid document before asking a question.' : (pageError || 'Open a supported webpage before asking PageGlance.'))
+    const importedDoc = importedDocumentRef.current
+    if (!activeDocument && !importedDoc && (pageStatus !== 'ready' || !pageUrlRef.current)) {
+      setError(pageError || 'Open a supported webpage before asking PageGlance.')
       return
     }
 
@@ -396,24 +588,34 @@ function App({ initialTheme, fullPage = false }: AppProps) {
     let partialAnswer = ''
 
     try {
+      const askDocument = activeDocument ?? importedDoc
       let page: PageContext | null = null
-      if (!activeDocument) {
+      if (!askDocument) {
         page = pageContextRef.current
         if (!page) {
           const sourceTabId = fullPage ? Number(new URLSearchParams(location.search).get('sourceTabId')) : NaN
           const tab = Number.isInteger(sourceTabId) && sourceTabId > 0
-            ? await chrome.tabs.get(sourceTabId)
-            : (await chrome.tabs.query({ active: true, currentWindow: true }))[0]
+            ? await browser.tabs.get(sourceTabId)
+            : (await browser.tabs.query({ active: true, currentWindow: true }))[0]
           if (tab?.id === undefined) throw new Error('Could not find the active tab.')
-          page = await extractPage(tab.id)
+          const outcome = await extractWithRecovery(tab.id)
+          if (!outcome.ok) {
+            setExtractionFailure(outcome.failure)
+            throw new Error(outcome.failure.message)
+          }
+          page = outcome.page
           pageContextRef.current = page
         }
         if (normalizePageUrl(page.url) !== pageUrlRef.current) {
           throw new Error('The active page changed. Close and reopen PageGlance on the new page.')
         }
       }
-      const conversationKey = activeDocument ? `document:${activeDocument.document_id}` : pageUrlRef.current
-      const conversationTitle = activeDocument?.filename ?? page?.title ?? pageTitleRef.current
+      const conversationKey = askDocument
+        ? `document:${askDocument.document_id}`
+        : pageUrlRef.current
+      const conversationTitle = askDocument
+        ? (activeDocument?.filename ?? importedDoc?.title ?? '')
+        : page?.title ?? pageTitleRef.current
       const current = conversationRef.current ?? emptyConversation(conversationKey, conversationTitle)
       const history = buildConversationHistory(
         current.messages,
@@ -435,12 +637,13 @@ function App({ initialTheme, fullPage = false }: AppProps) {
       const payload: AskRequest = createScopedAskRequest(
         trimmedQuestion,
         page,
-        activeDocument,
+        askDocument,
         history,
       )
-      const response = await fetch(`${API_URL}/ask/stream`, {
+      const token = await ensureInstallation({ apiUrl: API_BASE_URL })
+      const response = await fetch(`${API_BASE_URL}/ask/stream`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify(payload),
         signal: controller.signal,
       })
@@ -520,7 +723,7 @@ function App({ initialTheme, fullPage = false }: AppProps) {
           const message = getErrorMessage(caught)
           setError(
             message.includes('Failed to fetch') || message.includes('NetworkError')
-              ? `Could not reach the PageGlance API at ${API_URL}. Check the backend and VITE_PAGEGLANCE_API_URL setting.`
+              ? `Could not reach the PageGlance API at ${API_BASE_URL}. Check the backend and VITE_PAGEGLANCE_API_URL setting.`
               : message,
           )
         }
@@ -634,17 +837,17 @@ function App({ initialTheme, fullPage = false }: AppProps) {
         else queuePageSave()
       }
       await persistQueueRef.current
-      const fullPageUrl = new URL(chrome.runtime.getURL('chat.html'))
+      const fullPageUrl = new URL(browser.runtime.getURL('chat.html'))
       const sourceTabId = fullPage ? Number(new URLSearchParams(location.search).get('sourceTabId')) : NaN
       const sourceTab = Number.isInteger(sourceTabId) && sourceTabId > 0
-        ? await chrome.tabs.get(sourceTabId)
-        : (await chrome.tabs.query({ active: true, currentWindow: true }))[0]
+        ? await browser.tabs.get(sourceTabId)
+        : (await browser.tabs.query({ active: true, currentWindow: true }))[0]
       if (!sourceTab?.id) throw new Error('Could not identify the current webpage.')
       fullPageUrl.searchParams.set('sourceTabId', String(sourceTab.id))
       if (selectedDocumentRef.current) {
         fullPageUrl.searchParams.set('documentId', selectedDocumentRef.current.document_id)
       }
-      await chrome.tabs.create({ url: fullPageUrl.toString(), active: true })
+      await browser.tabs.create({ url: fullPageUrl.toString(), active: true })
     } catch {
       setError('Could not open PageGlance in a new tab. Your saved conversation is unchanged.')
     }
@@ -656,6 +859,7 @@ function App({ initialTheme, fullPage = false }: AppProps) {
     (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)
   const messages = conversation?.messages ?? []
   const canAsk = restoreReady && (selectedDocument ? true : pageStatus === 'ready') && !loading
+  const showingUrlImportRecovery = extractionFailure?.action === FallbackAction.OFFER_URL_IMPORT
   const uploadControl = (
     <button
       type="button"
@@ -831,6 +1035,53 @@ function App({ initialTheme, fullPage = false }: AppProps) {
             <div className={`page-state page-state-${pageStatus}`} aria-label={`Page status: ${pageStatus}`} />
           </section>
         )}
+      </div>
+
+      <div className="ingest-bar" aria-label="Add content">
+        {!showingUrlImportRecovery && (
+          <form
+            className="url-import-form"
+            onSubmit={(event) => {
+              event.preventDefault()
+              void handleImportUrl()
+            }}
+          >
+            <label htmlFor="ingest-url-input">Import by URL</label>
+            <div className="url-import-row">
+              <input
+                id="ingest-url-input"
+                type="text"
+                inputMode="url"
+                value={urlImportDraft}
+                onChange={(event) => setUrlImportDraft(event.target.value)}
+                placeholder="https://example.com/article"
+                disabled={urlImportState.status === 'uploading'}
+              />
+              <button
+                type="submit"
+                className="url-import-submit"
+                disabled={urlImportState.status === 'uploading' || !urlImportDraft.trim()}
+              >
+                {urlImportState.status === 'uploading' ? 'Importing…' : 'Import URL'}
+              </button>
+            </div>
+            {urlImportState.status === 'success' && (
+              <p className="document-feedback" role="status">{urlImportState.message}</p>
+            )}
+            {urlImportState.status === 'error' && (
+              <p className="message error document-feedback" role="alert">{urlImportState.message}</p>
+            )}
+          </form>
+        )}
+        <button
+          type="button"
+          className="quiet-button reextract-button"
+          onClick={() => void handleReextract()}
+          disabled={loading || !restoreReady || pageStatus === 'loading' || !!selectedDocument || uploadState.status === 'uploading' || urlImportState.status === 'uploading'}
+          title={selectedDocument ? 'Switch to Current webpage to re-extract it' : 'Re-extract the current page'}
+        >
+          <span aria-hidden="true">↻</span> Re-extract page
+        </button>
         {uploadControl}
       </div>
       {uploadState.status === 'uploading' && <p className="document-feedback" role="status">Uploading {uploadState.filename}...</p>}
@@ -848,7 +1099,112 @@ function App({ initialTheme, fullPage = false }: AppProps) {
 
       {!restoreReady && <div className="restore-status" role="status">Restoring your chat…</div>}
       {!selectedDocument && pageStatus === 'unsupported' && (
-        <p className="message error" role="alert">{pageError || 'Open a supported webpage to use suggestions and ask questions.'}</p>
+        extractionFailure ? (
+          <section className="unsupported-state" aria-label="Page could not be read">
+            <span className="unsupported-icon" aria-hidden="true">⚠️</span>
+            <div>
+              <h2 className="unsupported-title">Couldn’t read this page</h2>
+              <p className="unsupported-copy">{extractionFailure.message}</p>
+              {extractionFailure.action === FallbackAction.OFFER_URL_IMPORT && (
+                <form
+                  className="url-import-form"
+                  onSubmit={(event) => {
+                    event.preventDefault()
+                    void handleImportUrl()
+                  }}
+                >
+                  <label htmlFor="url-import-input">Import this page by URL</label>
+                  <div className="url-import-row">
+                    <input
+                      id="url-import-input"
+                      type="text"
+                      inputMode="url"
+                      value={urlImportDraft}
+                      onChange={(event) => setUrlImportDraft(event.target.value)}
+                      placeholder="https://example.com/article"
+                      disabled={urlImportState.status === 'uploading'}
+                    />
+                    <button
+                      type="submit"
+                      className="url-import-submit"
+                      disabled={urlImportState.status === 'uploading' || !urlImportDraft.trim()}
+                    >
+                      {urlImportState.status === 'uploading' ? 'Importing…' : 'Import URL'}
+                    </button>
+                  </div>
+                  {urlImportState.status === 'success' && (
+                    <p className="document-feedback" role="status">{urlImportState.message}</p>
+                  )}
+                  {urlImportState.status === 'error' && (
+                    <p className="message error document-feedback" role="alert">{urlImportState.message}</p>
+                  )}
+                  <p className="unsupported-instruction">
+                    Or use the <strong>Upload</strong> button to add a TXT/PDF transcript for this page.
+                  </p>
+                </form>
+              )}
+              {extractionFailure.action === FallbackAction.OFFER_MANUAL_UPLOAD && (
+                <div className="manual-upload-recovery">
+                  <p className="unsupported-copy">
+                    Use the <strong>Upload</strong> control to add this page as a TXT or PDF document
+                    and ask about it right away.
+                  </p>
+                  <button
+                    type="button"
+                    className="document-upload-button"
+                    onClick={() => documentFileInputRef.current?.click()}
+                    disabled={uploadState.status === 'uploading' || loading || !restoreReady}
+                  >
+                    {uploadState.status === 'uploading' ? (
+                      <span className="document-upload-spinner" aria-hidden="true" />
+                    ) : (
+                      <svg viewBox="0 0 20 20" aria-hidden="true">
+                        <path d="M5.5 2.5h6l3 3v12h-9z" />
+                        <path d="M11.5 2.5v3h3M7.5 12h5M10 9.5v5" />
+                      </svg>
+                    )}
+                    <span className="upload-button-label">
+                      {uploadState.status === 'uploading' ? 'Uploading' : '📤 Upload'}
+                    </span>
+                  </button>
+                </div>
+              )}
+              {extractionFailure.action === FallbackAction.RETRY_ACTIVE_TAB_EXTRACTION && (
+                <p className="unsupported-instruction">
+                  Automatic retry didn’t recover this page. Try <strong>reopening</strong> it, then ask again.
+                </p>
+              )}
+              {extractionFailure.action === FallbackAction.STOP && (
+                <p className="unsupported-instruction">
+                  Reopen the page in a regular <strong>http</strong> or <strong>https</strong> tab and try again.
+                </p>
+              )}
+              {extractionFailure.action === FallbackAction.USE_ALTERNATE_EXTRACTION && (
+                <p className="unsupported-instruction">
+                  This page can’t be read directly. Try opening it in a regular <strong>http</strong> or <strong>https</strong> tab, or use the <strong>Upload</strong> button to add a TXT/PDF transcript.
+                </p>
+              )}
+              {extractionFailure.action === FallbackAction.RETRY_INGESTION && (
+                <p className="unsupported-instruction">
+                  The PageGlance backend couldn’t be reached. Make sure the backend is running, then reopen PageGlance and try again.
+                </p>
+              )}
+            </div>
+          </section>
+        ) : (
+          <section className="unsupported-state" aria-label="Unsupported page">
+            <span className="unsupported-icon" aria-hidden="true">🔒</span>
+            <div>
+              <h2 className="unsupported-title">This page can’t be analyzed</h2>
+              <p className="unsupported-copy">
+                Browser security restrictions prevent PageGlance from reading this page.
+              </p>
+              <p className="unsupported-instruction">
+                Open a regular <strong>http</strong> or <strong>https</strong> webpage, then try again.
+              </p>
+            </div>
+          </section>
+        )
       )}
       {selectedDocument && restoreReady && !messages.length && (
         <p className="document-welcome">Ask a question about {selectedDocument.filename}.</p>
@@ -919,6 +1275,7 @@ function App({ initialTheme, fullPage = false }: AppProps) {
       <form className="composer" onSubmit={handleSubmit}>
         <label htmlFor="question">{selectedDocument ? 'QUESTION ABOUT DOCUMENT' : 'YOUR QUESTION'}</label>
         <textarea
+          ref={questionInputRef}
           id="question"
           value={question}
           onChange={(event) => handleDraftChange(event.target.value)}
