@@ -788,21 +788,30 @@ def ask(
             len(prepared.retrieved_sources or []),
             _evidence_context_chars(prepared.page_context, prepared.retrieved_sources),
         )
+        history_max_messages, history_max_chars = get_history_limits()
+        bounded_history = _bounded_history(request.history, history_max_messages, history_max_chars)
+        retrieved_sources = _bounded_retrieved_sources(
+            prepared.retrieved_sources,
+            context_limit=context_limit,
+            page_text_chars=len(prepared.page_context["text"]),
+            question=request.question,
+            history_chars=sum(len(item["content"]) for item in bounded_history),
+            max_completion_tokens=get_settings().max_completion_tokens,
+        )
         if diagnostic_answer is not None:
             answer = diagnostic_answer
         else:
-            history_max_messages, history_max_chars = get_history_limits()
             with langsmith_tracing.trace_run(name='pageglance.llm.generation', run_type='llm'):
                 answer = get_answer_service().answer(
-                request.question,
-                prepared.page_context,
-                _bounded_history(request.history, history_max_messages, history_max_chars),
-                prepared.retrieved_sources,
-            )
+                    request.question,
+                    prepared.page_context,
+                    bounded_history,
+                    retrieved_sources,
+                )
             with langsmith_tracing.trace_run(name='pageglance.citation.validation', run_type='chain'):
                 answer = _validate_grounded_answer(
-                answer, prepared.retrieved_sources, prepared.page_context
-            )
+                    answer, retrieved_sources, prepared.page_context
+                )
     except LLMConfigurationError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     except APITimeoutError as error:
@@ -822,7 +831,7 @@ def ask(
         ) from error
 
     citations = (
-        None if diagnostic_answer is not None else _citation_sources(prepared.retrieved_sources)
+        None if diagnostic_answer is not None else _citation_sources(retrieved_sources)
     )
     return AskResponse(answer=answer, sources=citations)
 
@@ -849,6 +858,47 @@ def _bounded_history(
             remaining -= len(message.content)
     chosen.reverse()
     return [message.model_dump() for message in chosen]
+
+
+_CHARS_PER_TOKEN = 4
+_RAG_SYSTEM_PROMPT_CHARS = 2600
+_PER_SOURCE_METADATA_CHARS = 384
+
+
+def _bounded_retrieved_sources(
+    sources: list[dict[str, object]] | None,
+    *,
+    context_limit: int,
+    page_text_chars: int,
+    question: str,
+    history_chars: int,
+    max_completion_tokens: int,
+) -> list[dict[str, object]] | None:
+    """Trim retrieved chunks to whole, most-relevant items that fit a token-aware budget.
+
+    Budget = context_limit minus fixed overhead (system prompt, question, bounded
+    history, and reserved output tokens). Only complete chunks are retained; lower-
+    ranked chunks are dropped whole so no cited content is truncated or discarded.
+    """
+    if not sources:
+        return sources
+    overhead = (
+        _RAG_SYSTEM_PROMPT_CHARS
+        + len(question)
+        + history_chars
+        + max_completion_tokens * _CHARS_PER_TOKEN
+    )
+    available = max(0, context_limit - page_text_chars - overhead)
+    kept: list[dict[str, object]] = []
+    spent = 0
+    for source in sources:
+        text = source.get("text", "")
+        cost = (len(text) if isinstance(text, str) else 0) + _PER_SOURCE_METADATA_CHARS
+        if spent + cost > available:
+            continue
+        kept.append(source)
+        spent += cost
+    return kept
 
 
 def _provider_error(error: Exception) -> tuple[str, str]:
@@ -978,6 +1028,14 @@ async def ask_stream(
         settings.history_max_messages,
         settings.history_max_chars,
     )
+    retrieved_sources = _bounded_retrieved_sources(
+        prepared.retrieved_sources,
+        context_limit=settings.context_max_chars,
+        page_text_chars=len(prepared.page_context["text"]),
+        question=request.question,
+        history_chars=sum(len(item["content"]) for item in history),
+        max_completion_tokens=settings.max_completion_tokens,
+    )
     return StreamingResponse(
         _answer_events(
             request,
@@ -985,10 +1043,10 @@ async def ask_stream(
             prepared.page_context,
             len(request.page.text) if request.page else 0,
             history,
-            prepared.retrieved_sources,
+            retrieved_sources,
             None
             if diagnostic_answer is not None
-            else _citation_sources(prepared.retrieved_sources),
+            else _citation_sources(retrieved_sources),
             diagnostic_answer,
         ),
         media_type="text/event-stream",
