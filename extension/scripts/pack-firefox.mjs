@@ -31,7 +31,7 @@ const OUT_ZIP =
     homedir(),
     'Desktop',
     'PageGlance-Releases',
-    'PageGlance-Firefox-v0.1.0.zip',
+    'PageGlance-Firefox-v0.1.1.zip',
   );
 
 // ---- utility: POSIX relative path with forward slashes ----

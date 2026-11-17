@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { inflateRawSync } from 'node:zlib';
 
 const ZIP = process.env.PACK_OUT_ZIP ||
-  `${process.env.USERPROFILE || process.env.HOME}\\Desktop\\PageGlance-Releases\\PageGlance-Firefox-v0.1.0.zip`;
+  `${process.env.USERPROFILE || process.env.HOME}\\Desktop\\PageGlance-Releases\\PageGlance-Firefox-v0.1.1.zip`;
 
 const b = readFileSync(ZIP);
 

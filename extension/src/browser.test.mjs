@@ -70,7 +70,7 @@ test('firefox manifest is valid Manifest V3 with gecko settings', () => {
   const manifest = loadManifest('firefox')
   assert.equal(manifest.manifest_version, 3)
   assert.equal(manifest.name, 'PageGlance')
-  assert.equal(manifest.version, '0.1.0')
+  assert.equal(manifest.version, '0.1.1')
   assert.ok(manifest.action)
   assert.equal(manifest.action.default_popup, 'index.html')
   assert.ok(manifest.permissions)
@@ -78,11 +78,12 @@ test('firefox manifest is valid Manifest V3 with gecko settings', () => {
   assert.ok(manifest.permissions.includes('scripting'))
   assert.ok(manifest.permissions.includes('activeTab'))
   assert.ok(manifest.host_permissions)
-  assert.ok(manifest.host_permissions.some((p) => p.includes('localhost')))
-  assert.ok(manifest.host_permissions.some((p) => p.includes('127.0.0.1')))
   assert.ok(
     manifest.host_permissions.some((p) => p.includes('ansh9057-pageglance-backend.hf.space')),
   )
+  // Production Firefox manifest has no localhost/127.0.0.1 host permissions
+  assert.ok(!manifest.host_permissions.some((p) => p.includes('localhost')))
+  assert.ok(!manifest.host_permissions.some((p) => p.includes('127.0.0.1')))
   // No broad wildcard permissions
   assert.ok(!manifest.host_permissions.includes('https://*'))
   assert.ok(!manifest.host_permissions.includes('<all_urls>'))
@@ -97,7 +98,7 @@ test('chrome and firefox manifests have consistent core fields', () => {
   const chrome = loadManifest('chrome')
   const firefox = loadManifest('firefox')
   assert.equal(chrome.name, firefox.name)
-  assert.equal(chrome.version, firefox.version)
+  // Firefox and Chrome versions are intentionally independent (Firefox 0.1.1 vs Chrome 0.1.0)
   assert.equal(chrome.manifest_version, firefox.manifest_version)
   assert.deepEqual(chrome.permissions, firefox.permissions)
   assert.deepEqual(chrome.action.default_popup, firefox.action.default_popup)
