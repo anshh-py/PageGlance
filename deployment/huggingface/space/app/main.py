@@ -27,9 +27,12 @@ from app.llm import (
     LLMConfigurationError,
     LLMResponseError,
     LLMSettings,
+    RAG_SYSTEM_INSTRUCTIONS,
+    estimate_tokens,
     get_answer_service,
     get_context_max_chars,
     get_history_limits,
+    get_model_input_tokens,
     get_settings,
     stream_answer,
 )
@@ -788,21 +791,29 @@ def ask(
             len(prepared.retrieved_sources or []),
             _evidence_context_chars(prepared.page_context, prepared.retrieved_sources),
         )
+        history_max_messages, history_max_chars = get_history_limits()
+        bounded_history = _bounded_history(request.history, history_max_messages, history_max_chars)
+        retrieved_sources = _budget_bounded_context(
+            prepared.retrieved_sources,
+            page_text=prepared.page_context["text"],
+            question=request.question,
+            history=bounded_history,
+            max_completion_tokens=get_settings().max_completion_tokens,
+        )
         if diagnostic_answer is not None:
             answer = diagnostic_answer
         else:
-            history_max_messages, history_max_chars = get_history_limits()
             with langsmith_tracing.trace_run(name='pageglance.llm.generation', run_type='llm'):
                 answer = get_answer_service().answer(
-                request.question,
-                prepared.page_context,
-                _bounded_history(request.history, history_max_messages, history_max_chars),
-                prepared.retrieved_sources,
-            )
+                    request.question,
+                    prepared.page_context,
+                    bounded_history,
+                    retrieved_sources,
+                )
             with langsmith_tracing.trace_run(name='pageglance.citation.validation', run_type='chain'):
                 answer = _validate_grounded_answer(
-                answer, prepared.retrieved_sources, prepared.page_context
-            )
+                    answer, retrieved_sources, prepared.page_context
+                )
     except LLMConfigurationError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     except APITimeoutError as error:
@@ -822,7 +833,7 @@ def ask(
         ) from error
 
     citations = (
-        None if diagnostic_answer is not None else _citation_sources(prepared.retrieved_sources)
+        None if diagnostic_answer is not None else _citation_sources(retrieved_sources)
     )
     return AskResponse(answer=answer, sources=citations)
 
@@ -849,6 +860,105 @@ def _bounded_history(
             remaining -= len(message.content)
     chosen.reverse()
     return [message.model_dump() for message in chosen]
+
+
+_SAFETY_MARGIN_TOKENS = 1024
+_JSON_WRAPPER_OVERHEAD_TOKENS = 96
+_PER_SOURCE_METADATA_TOKENS = 48
+
+
+def _mandatory_request_tokens(
+    question: str,
+    page_text: str,
+    history: list[dict[str, str]],
+) -> int:
+    """Estimate the tokens consumed by content that must always be present.
+
+    This covers the system instructions, the current question, the bounded
+    conversation history, the selected page text, and the JSON wrapper overhead.
+    It is shared by both routes so normal and streaming requests budget identically.
+    """
+    return (
+        estimate_tokens(RAG_SYSTEM_INSTRUCTIONS)
+        + estimate_tokens(question)
+        + sum(estimate_tokens(item.get("content", "")) for item in history)
+        + estimate_tokens(page_text)
+        + _JSON_WRAPPER_OVERHEAD_TOKENS
+    )
+
+
+def _bounded_retrieved_sources(
+    sources: list[dict[str, object]] | None,
+    *,
+    page_text: str,
+    question: str,
+    history: list[dict[str, str]],
+    max_completion_tokens: int,
+    model_input_tokens: int | None = None,
+) -> list[dict[str, object]] | None:
+    """Trim retrieved chunks to whole, most-relevant items that fit a token-aware budget.
+
+    Budget = model input-token limit minus fixed overhead (system prompt, question,
+    bounded history, selected page text, JSON wrapper overhead, and reserved output
+    tokens plus a safety margin). Only complete chunks are retained; lower-ranked
+    chunks are dropped whole so no cited content is truncated or discarded. This is
+    the single shared mechanism used by both the ``ask`` and ``ask_stream`` routes.
+    """
+    if not sources:
+        return sources
+    limit = model_input_tokens if model_input_tokens is not None else get_model_input_tokens()
+    base = _mandatory_request_tokens(question, page_text, history)
+    available = max(0, limit - max_completion_tokens - _SAFETY_MARGIN_TOKENS - base)
+    kept: list[dict[str, object]] = []
+    spent = 0
+    for source in sources:
+        text = source.get("text", "")
+        cost = (
+            estimate_tokens(text) if isinstance(text, str) else 0
+        ) + _PER_SOURCE_METADATA_TOKENS
+        if spent + cost > available:
+            continue
+        kept.append(source)
+        spent += cost
+    return kept
+
+
+def _budget_bounded_context(
+    retrieved_sources: list[dict[str, object]] | None,
+    *,
+    page_text: str,
+    question: str,
+    history: list[dict[str, str]],
+    max_completion_tokens: int,
+) -> list[dict[str, object]] | None:
+    """Shared request-budget gate for both ``ask`` and ``ask_stream``.
+
+    Computes the full assembled request (system instructions + question + bounded
+    history + selected page text + JSON wrapper) plus reserved completion tokens
+    and a safety margin. If that mandatory content alone cannot fit the model's
+    input budget, this raises a recoverable ``422`` instead of silently sending an
+    oversized request to the provider. Otherwise it returns retrieved sources
+    trimmed deterministically to the remaining budget.
+    """
+    limit = get_model_input_tokens()
+    mandatory = _mandatory_request_tokens(question, page_text, history)
+    reserved = max_completion_tokens + _SAFETY_MARGIN_TOKENS
+    if mandatory + reserved > limit:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "The combined question, conversation, and page context exceed the "
+                "model's input limit. Shorten the page or question and try again."
+            ),
+        )
+    return _bounded_retrieved_sources(
+        retrieved_sources,
+        page_text=page_text,
+        question=question,
+        history=history,
+        max_completion_tokens=max_completion_tokens,
+        model_input_tokens=limit,
+    )
 
 
 def _provider_error(error: Exception) -> tuple[str, str]:
@@ -978,6 +1088,13 @@ async def ask_stream(
         settings.history_max_messages,
         settings.history_max_chars,
     )
+    retrieved_sources = _budget_bounded_context(
+        prepared.retrieved_sources,
+        page_text=prepared.page_context["text"],
+        question=request.question,
+        history=history,
+        max_completion_tokens=settings.max_completion_tokens,
+    )
     return StreamingResponse(
         _answer_events(
             request,
@@ -985,10 +1102,10 @@ async def ask_stream(
             prepared.page_context,
             len(request.page.text) if request.page else 0,
             history,
-            prepared.retrieved_sources,
+            retrieved_sources,
             None
             if diagnostic_answer is not None
-            else _citation_sources(prepared.retrieved_sources),
+            else _citation_sources(retrieved_sources),
             diagnostic_answer,
         ),
         media_type="text/event-stream",

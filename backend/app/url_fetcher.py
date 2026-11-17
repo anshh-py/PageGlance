@@ -236,6 +236,11 @@ async def _build_pinned_http_client(timeout: float) -> httpx.AsyncClient:
                 extensions=resp.extensions,
             )
 
+        async def aclose(self) -> None:
+            # Close the connection pool so pooled sockets are released when the
+            # owning httpx client is closed.
+            await pool.aclose()
+
     return httpx.AsyncClient(
         transport=_PinnedTransport(),
         follow_redirects=True,
@@ -259,7 +264,9 @@ async def fetch_url(
 
     owns_client = http_client is None
     if owns_client:
-        http_client = _build_pinned_http_client(timeout)
+        # _build_pinned_http_client is async; awaiting it is what returns a real
+        # client instead of a coroutine (fixes AttributeError on the owned path).
+        http_client = await _build_pinned_http_client(timeout)
     try:
         response = await http_client.get(url)
     except httpx.HTTPError:

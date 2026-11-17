@@ -96,12 +96,12 @@ class UploadBodyLimitMiddleware:
 
     @staticmethod
     async def _reject(send: Send) -> None:
+        # Keep the 413 explanation consistent with the endpoint's own validation so
+        # users see the same clear message regardless of which layer rejects the
+        # upload.
         body = json.dumps(
             {
-                "detail": (
-                    f"Upload request must be at most "
-                    f"{get_max_upload_bytes() + MAX_MULTIPART_OVERHEAD_BYTES} bytes."
-                )
+                "detail": f"Files must be {get_max_upload_mb()} MiB or smaller.",
             }
         ).encode("utf-8")
         await send(

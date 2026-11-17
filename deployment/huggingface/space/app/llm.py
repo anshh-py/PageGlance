@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import math
 import os
 import threading
 from collections.abc import AsyncIterator
@@ -76,6 +77,76 @@ using plain text or simple Markdown; never wrap the answer in a JSON object."""
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ENV_FILE = PROJECT_ROOT / ".env"
+
+# Model token-context configuration.
+#
+# The served model's actual input-token budget is the authoritative ceiling for
+# assembled provider requests. It is configurable (PAGEGLANCE_MODEL_INPUT_TOKENS)
+# because hosted models/resellers can expose different effective windows. The
+# default is deliberately conservative (well below the documented window of the
+# default model) so a request reliably fits with headroom; raise it via the
+# environment variable once the provider's real input window is confirmed.
+DEFAULT_MODEL_INPUT_TOKENS = 16_384
+MIN_MODEL_INPUT_TOKENS = 2_048
+MAX_MODEL_INPUT_TOKENS = 200_000
+
+
+def get_model_input_tokens() -> int:
+    """Return the bounded model input-token budget from the environment."""
+    try:
+        value = int(
+            os.getenv("PAGEGLANCE_MODEL_INPUT_TOKENS", str(DEFAULT_MODEL_INPUT_TOKENS))
+            .strip()
+            or DEFAULT_MODEL_INPUT_TOKENS
+        )
+    except ValueError as error:
+        raise LLMConfigurationError(
+            "PAGEGLANCE_MODEL_INPUT_TOKENS must be an integer."
+        ) from error
+    if not MIN_MODEL_INPUT_TOKENS <= value <= MAX_MODEL_INPUT_TOKENS:
+        raise LLMConfigurationError(
+            "PAGEGLANCE_MODEL_INPUT_TOKENS must be between "
+            f"{MIN_MODEL_INPUT_TOKENS} and {MAX_MODEL_INPUT_TOKENS}."
+        )
+    return value
+
+
+def _load_tokenizer_encoding():
+    """Best-effort tokenizer; returns None when it is unavailable."""
+    try:
+        import tiktoken
+    except Exception:
+        return None
+    try:
+        return tiktoken.get_encoding("cl100k_base")
+    except Exception:
+        try:
+            return tiktoken.get_encoding("o200k_base")
+        except Exception:
+            return None
+
+
+@lru_cache(maxsize=1)
+def _tokenizer():
+    return _load_tokenizer_encoding()
+
+
+def estimate_tokens(text: str | None) -> int:
+    """Estimate token count, preferring a real tokenizer with a char fallback.
+
+    The fallback uses a conservative 3 characters per token (fewer chars per
+    token means a higher token estimate, which is the safe direction for budget-
+    capping).
+    """
+    if not text:
+        return 0
+    enc = _tokenizer()
+    if enc is not None:
+        try:
+            return len(enc.encode(text))
+        except Exception:
+            pass
+    return max(1, math.ceil(len(text) / 3))
 
 
 def load_environment() -> None:

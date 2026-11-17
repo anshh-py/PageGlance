@@ -824,6 +824,66 @@ def test_asgi_limit_accepts_declared_request_above_legacy_25_mib_cap(monkeypatch
     assert response_messages == []
 
 
+def test_upload_limit_below_limit_reaches_route_and_over_limit_returns_clear_413(
+    monkeypatch,
+) -> None:
+    """Focused regression: a small upload passes through; an oversized one is
+    rejected by the middleware with a clear, user-facing message."""
+    import asyncio
+
+    monkeypatch.setenv("PAGEGLANCE_MAX_UPLOAD_MB", "2")
+    max_request_bytes = 2 * 1024 * 1024 + MAX_MULTIPART_OVERHEAD_BYTES
+
+    async def run_case(body_bytes, expect_413):
+        reached_route = False
+        responses = []
+        chunks = [
+            {"type": "http.request", "body": body_bytes, "more_body": False},
+            {"type": "http.disconnect"},
+        ]
+
+        async def route_app(_scope, receive, _send):
+            nonlocal reached_route
+            reached_route = True
+            while True:
+                message = await receive()
+                if message["type"] != "http.request":
+                    break
+
+        async def receive():
+            return chunks.pop(0)
+
+        async def send(message):
+            responses.append(message)
+
+        middleware = UploadBodyLimitMiddleware(route_app)
+        await middleware(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/documents/upload",
+                "headers": [(b"content-length", str(len(body_bytes)).encode("ascii"))],
+            },
+            receive,
+            send,
+        )
+        if expect_413:
+            assert not reached_route
+            assert responses[0]["status"] == 413
+            body = b"".join(
+                part.get("body", b"")
+                for part in responses
+                if part["type"] == "http.response.body"
+            )
+            assert b"Files must be 2 MiB or smaller." in body
+        else:
+            assert reached_route
+            assert responses == []
+
+    asyncio.run(run_case(b"A" * 512, expect_413=False))
+    asyncio.run(run_case(b"x" * (max_request_bytes + 1), expect_413=True))
+
+
 def test_upload_txt_metadata_preserved_through_integrated_path() -> None:
     factory = sqlite_factory()
     embedding = FakeEmbeddingService()
